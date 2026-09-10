@@ -57,3 +57,34 @@ never contained the DEV canary.
   can learn the fixture's distinction on a 4-case DEV set.
 - It does not show label efficiency, production reliability, or that every run
   improves. A no-improvement run is a valid outcome and is recorded as such.
+
+## Full application run through the API (2026-09-10)
+
+The complete workflow was driven through the HTTP API with the worker running
+against `openai/gpt-5.6-luna` for grading and reflection. The expert was
+simulated from the fixture truth table through the ordinary judgment endpoint
+(every judgment is marked `[SIMULATED]`). Raw report:
+`docs/real_model_application_run.json`; exported grader bundle:
+`docs/real_model_grader_bundle.json` (credential-free, 0 matches for key patterns).
+
+Project configuration for this run: 60 metric calls per round, 4 threads,
+shortlist 4, committee size 3, probe 10, pool 24. Wall clock: 6.6 minutes.
+
+| Step | Measured outcome |
+|---|---|
+| Import | 72 synthetic traces, 50 groups, 1 exact duplicate merged, small-import warning shown |
+| Bootstrap labels | 11 resolved TRAIN (+1 CANNOT_JUDGE), 8 DEV (3 PASS / 5 FAIL) |
+| Round 1 | seed DEV agreement 0.75, best candidate 0.875, **not recommended**: its coverage fell from 1.0 to 0.875 (one REVIEW), so the conservative rule kept the incumbent. 80 provider calls (78 grading, 2 reflection), ~99k tokens, 61 metric calls |
+| Selection round | only one candidate cleared the quality floor (seed excluded, 0.75 < 0.775), so no committee: 6 disagreement slots reported exhausted and filled randomly, batch = 2 coverage + 8 random, categories hidden until judged |
+| Round 2 | after 10 more TRAIN labels (21 TRAIN, 8 DEV): seed 0.75, best candidate **1.0** with 0 false passes and full coverage, recommended and selected as shadow. One other candidate regressed to 0.25 with a false pass and is reported as such. 90 calls, ~129k tokens |
+| Export | grader bundle with manifest, pipeline hash, dependency versions, no audits, automation DISABLED |
+
+The round-2 instruction (see the bundle) spells out the accepted/queued versus
+completed distinction, allows a truthful "could not cancel" answer when no tool
+call is recorded, and warns against inferring extra requirements. It was
+learned from TRAIN feedback; the generic seed contains none of it.
+
+What this run does not show: production accuracy (DEV has 8 cases and the
+reserve holds only ~7 groups), committee-driven selection (a second usable
+candidate never cleared the quality floor on this tiny DEV set), or an audit
+(the fixture is synthetic, so no audit sample can be locked).
