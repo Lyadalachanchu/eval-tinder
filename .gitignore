@@ -1,0 +1,18 @@
+# secrets / local config
+.env
+.env.*
+!.env.example
+# python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+backend/artifacts/
+backend/var/
+# node
+frontend/node_modules/
+frontend/dist/
+# misc
+*.log
+.DS_Store
