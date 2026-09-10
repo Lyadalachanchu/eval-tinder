@@ -23,6 +23,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+benchmarks = [
+    "pyarrow>=17",
+]
 dev = [
     "pytest==9.0.2",
     "pytest-timeout==2.4.0",

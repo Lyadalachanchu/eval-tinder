@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     artifact_path: Path = Path("./artifacts")
     max_upload_bytes: int = 25 * 1024 * 1024
     max_case_chars: int = 40_000  # rendered-case input budget before REVIEW/CONTEXT_TOO_LARGE
+    grading_concurrency: int = 4  # parallel provider calls inside one grading batch (DEV evals, probes, pools, audits)
 
     # Application-level provider budgets (a metric-call budget is not a token budget).
     max_provider_calls_per_job: int = 2000

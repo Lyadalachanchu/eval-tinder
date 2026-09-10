@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any
 
@@ -116,43 +117,37 @@ def _assert_not_sealed(session: Session, trace: TraceSnapshot, purpose: str) -> 
         raise SealedMaterial(f"AUDIT_RESERVE material is not available for {purpose}")
 
 
-def grade_trace(
-    session: Session,
-    project: Project,
-    runtime: GraderRuntime,
-    trace: TraceSnapshot,
-    *,
-    purpose: str,
-    job_id: str | None = None,
-    audit_run_id: str | None = None,
-    use_cache: bool = True,
-    settings: Settings | None = None,
+def _lookup_cache(session: Session, key: str) -> GradingRun | None:
+    return session.scalar(
+        select(GradingRun)
+        .where(GradingRun.cache_key == key, GradingRun.status == GradingStatus.OK, GradingRun.cache_hit_of.is_(None))
+        .order_by(GradingRun.created_at)
+        .limit(1)
+    )
+
+
+def _persist_hit(
+    session: Session, project: Project, runtime: GraderRuntime, trace: TraceSnapshot, key: str, hit: GradingRun, *,
+    purpose: str, job_id: str | None, audit_run_id: str | None,
 ) -> GradingRun:
-    settings = settings or get_settings()
-    _assert_not_sealed(session, trace, purpose)
-    case = render_trace(trace)
-    key = cache_key_for(project, runtime.manifest, case)
-    if use_cache:
-        hit = session.scalar(
-            select(GradingRun)
-            .where(GradingRun.cache_key == key, GradingRun.status == GradingStatus.OK, GradingRun.cache_hit_of.is_(None))
-            .order_by(GradingRun.created_at)
-            .limit(1)
-        )
-        if hit is not None:
-            run = GradingRun(
-                project_id=project.id, grader_id=runtime.grader.id, trace_id=trace.id, purpose=purpose,
-                prompt_hash=hit.prompt_hash, cache_key=key, cache_hit_of=hit.id, status=hit.status,
-                verdict=hit.verdict, evidence=hit.evidence, explanation=hit.explanation, usage={"cached": True},
-                latency_ms=0, error=None, attempt=hit.attempt, job_id=job_id, audit_run_id=audit_run_id,
-            )
-            session.add(run)
-            # A cache hit is still a use of this group for `purpose`: exposure history must not depend on
-            # whether the provider was actually called, or a cached probe/pool/bulk use would go unrecorded.
-            _record_purpose_exposure(session, project, trace, purpose, job_id)
-            session.flush()
-            return run
-    result = runtime.grade_case(case, max_case_chars=settings.max_case_chars)
+    run = GradingRun(
+        project_id=project.id, grader_id=runtime.grader.id, trace_id=trace.id, purpose=purpose,
+        prompt_hash=hit.prompt_hash, cache_key=key, cache_hit_of=hit.id, status=hit.status,
+        verdict=hit.verdict, evidence=hit.evidence, explanation=hit.explanation, usage={"cached": True},
+        latency_ms=0, error=None, attempt=hit.attempt, job_id=job_id, audit_run_id=audit_run_id,
+    )
+    session.add(run)
+    # A cache hit is still a use of this group for `purpose`: exposure history must not depend on
+    # whether the provider was actually called, or a cached probe/pool/bulk use would go unrecorded.
+    _record_purpose_exposure(session, project, trace, purpose, job_id)
+    session.flush()
+    return run
+
+
+def _persist_result(
+    session: Session, project: Project, runtime: GraderRuntime, trace: TraceSnapshot, key: str, result: GradeResult, *,
+    purpose: str, job_id: str | None, audit_run_id: str | None,
+) -> GradingRun:
     run = GradingRun(
         project_id=project.id,
         grader_id=runtime.grader.id,
@@ -178,6 +173,32 @@ def grade_trace(
     return run
 
 
+def grade_trace(
+    session: Session,
+    project: Project,
+    runtime: GraderRuntime,
+    trace: TraceSnapshot,
+    *,
+    purpose: str,
+    job_id: str | None = None,
+    audit_run_id: str | None = None,
+    use_cache: bool = True,
+    settings: Settings | None = None,
+) -> GradingRun:
+    settings = settings or get_settings()
+    _assert_not_sealed(session, trace, purpose)
+    case = render_trace(trace)
+    key = cache_key_for(project, runtime.manifest, case)
+    if use_cache:
+        hit = _lookup_cache(session, key)
+        if hit is not None:
+            return _persist_hit(session, project, runtime, trace, key, hit, purpose=purpose, job_id=job_id,
+                                audit_run_id=audit_run_id)
+    result = runtime.grade_case(case, max_case_chars=settings.max_case_chars)
+    return _persist_result(session, project, runtime, trace, key, result, purpose=purpose, job_id=job_id,
+                           audit_run_id=audit_run_id)
+
+
 def _record_purpose_exposure(
     session: Session, project: Project, trace: TraceSnapshot, purpose: str, job_id: str | None
 ) -> None:
@@ -198,18 +219,54 @@ def grade_many(
     use_cache: bool = True,
     on_progress=None,
     settings: Settings | None = None,
+    concurrency: int | None = None,
 ) -> list[GradingRun]:
-    runs = []
-    for i, trace in enumerate(traces):
-        run = grade_trace(
-            session, project, runtime, trace, purpose=purpose, job_id=job_id, audit_run_id=audit_run_id,
-            use_cache=use_cache, settings=settings,
-        )
-        runs.append(run)
-        if on_progress is not None:
-            on_progress(i + 1)
-        # Once the budget is spent, later traces still get cache hits (free) or a BUDGET_EXHAUSTED record
-        # without any model call and without an exposure event.
+    """Grade many traces; provider calls run in a thread pool, persistence stays sequential and ordered.
+
+    Cache lookups happen before dispatch, results are written in input order, and the
+    budget guard (thread-safe) still caps every call. Once the budget is spent later traces
+    get cache hits (free) or a BUDGET_EXHAUSTED record without any model call or exposure.
+    """
+    settings = settings or get_settings()
+    workers = max(1, int(concurrency if concurrency is not None else settings.grading_concurrency))
+    traces = list(traces)
+    runs: list[GradingRun] = []
+    done = 0
+    chunk_size = max(1, workers * 2)
+    for start_idx in range(0, len(traces), chunk_size):
+        chunk = traces[start_idx : start_idx + chunk_size]
+        prepared: list[tuple[TraceSnapshot, Any, str, GradingRun | None]] = []
+        for trace in chunk:
+            _assert_not_sealed(session, trace, purpose)
+            case = render_trace(trace)
+            key = cache_key_for(project, runtime.manifest, case)
+            hit = _lookup_cache(session, key) if use_cache else None
+            prepared.append((trace, case, key, hit))
+        misses = [i for i, (_, _, _, hit) in enumerate(prepared) if hit is None]
+        results: dict[int, GradeResult] = {}
+        if misses:
+            if workers == 1 or len(misses) == 1:
+                for i in misses:
+                    results[i] = runtime.grade_case(prepared[i][1], max_case_chars=settings.max_case_chars)
+            else:
+                with ThreadPoolExecutor(max_workers=min(workers, len(misses))) as pool:
+                    futures = {
+                        pool.submit(runtime.grade_case, prepared[i][1], max_case_chars=settings.max_case_chars): i
+                        for i in misses
+                    }
+                    for fut in as_completed(futures):
+                        results[futures[fut]] = fut.result()
+        for i, (trace, _case, key, hit) in enumerate(prepared):
+            if hit is not None:
+                run = _persist_hit(session, project, runtime, trace, key, hit, purpose=purpose, job_id=job_id,
+                                   audit_run_id=audit_run_id)
+            else:
+                run = _persist_result(session, project, runtime, trace, key, results[i], purpose=purpose,
+                                      job_id=job_id, audit_run_id=audit_run_id)
+            runs.append(run)
+            done += 1
+            if on_progress is not None:
+                on_progress(done)
     return runs
 
 
