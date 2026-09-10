@@ -25,14 +25,6 @@ from dspy.utils.dummies import dotdict
 FIELD_RE = re.compile(r"\[\[ ## (\w+) ## \]\]")
 
 
-def _section(text: str, name: str) -> str:
-    start = text.find(f"[{name}]")
-    end = text.find(f"[/{name}]")
-    if start < 0 or end < 0:
-        return ""
-    return text[start + len(name) + 2 : end].strip()
-
-
 @dataclass
 class CaseView:
     """Parsed view of the rendered case for scripted policies."""
@@ -46,21 +38,15 @@ class CaseView:
 
     @classmethod
     def from_user_prompt(cls, content: str) -> "CaseView":
-        def _json(name: str, default: Any) -> Any:
-            body = _section(content, name)
-            if not body:
-                return default
-            try:
-                return json.loads(body)
-            except json.JSONDecodeError:
-                return default
+        from eval_tinder.domain.rendering import extract_case_json
 
+        data = extract_case_json(content) or {}
         return cls(
-            user_request=_section(content, "USER_REQUEST"),
-            output=_section(content, "TARGET_OUTPUT"),
-            tool_calls=_json("TOOL_CALLS_JSON", []),
-            context=_json("CONTEXT_JSON", {}),
-            metadata=_json("TASK_METADATA_JSON", {}),
+            user_request=str(data.get("input", "")),
+            output=str(data.get("output", "")),
+            tool_calls=data.get("tool_calls") or [],
+            context=data.get("context", {}),
+            metadata=data.get("metadata") or {},
             raw=content,
         )
 

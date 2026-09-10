@@ -101,13 +101,13 @@ def test_grading_model_never_sees_labels_or_bookkeeping(gepa_run):
     for forbidden in (TRAIN_CANARY, DEV_CANARY, "expert_grade", "expert_explanation", "Expert grade", "partition"):
         assert forbidden not in text
     for call in grader.calls:
-        assert "[TARGET_OUTPUT]" in call.text
+        assert "<<<CASE_JSON" in call.text and '"output"' in call.text
         assert all(m.get("role") in {"system", "user", "assistant"} for m in call.messages)
 
 
 def test_separate_contexts_for_grading_and_reflection(gepa_run):
     grader, reflector = gepa_run["grader"], gepa_run["reflector"]
-    assert all("[USER_REQUEST]" in c.text for c in grader.calls)
+    assert all("<<<CASE_JSON" in c.text for c in grader.calls)
     assert all("[[ ## verdict ## ]]" not in c.output or True for c in reflector.calls)
     assert all("```" in c.output for c in reflector.calls)
 

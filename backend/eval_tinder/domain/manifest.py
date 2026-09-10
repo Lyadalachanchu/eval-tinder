@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from eval_tinder.domain.rendering import RENDERER_VERSION
 from eval_tinder.ids import hash_value
 
-PARSER_VERSION = "p1"
+PARSER_VERSION = "p2"
 METRIC_VERSION = "agreement-v1"
 MANIFEST_SCHEMA_VERSION = 1
 

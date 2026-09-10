@@ -7,11 +7,54 @@ the resolved value's string form. Invalid evidence never becomes PASS.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
 class EvidenceError(ValueError):
     pass
+
+
+# Section labels a model may echo instead of the data keys (older renderer names, upper-case variants).
+_KEY_ALIASES = {
+    "tool_calls_json": "tool_calls",
+    "toolcalls": "tool_calls",
+    "target_output": "output",
+    "user_request": "input",
+    "context_json": "context",
+    "task_metadata_json": "metadata",
+    "task_metadata": "metadata",
+}
+_TOP_LEVEL_KEYS = ("input", "context", "tool_calls", "output", "metadata")
+
+
+def normalize_pointer(pointer: str) -> str:
+    """Canonicalize common pointer spellings into an RFC 6901 pointer.
+
+    Accepts dotted/bracket paths (``tool_calls[0].result.status``), missing leading
+    slashes, and known section aliases (``/TOOL_CALLS_JSON/0``). This only rewrites
+    syntax; it never changes which value the pointer resolves to.
+    """
+    if not isinstance(pointer, str):
+        raise EvidenceError("pointer must be a string")
+    text = pointer.strip()
+    if text in ("", "/"):
+        return text
+    if text.startswith("#/"):
+        text = text[1:]
+    if not text.startswith("/"):
+        text = re.sub(r"\[(\d+)\]", r"/\1", text)
+        text = "/" + text.replace(".", "/")
+    text = text.replace("//", "/")
+    tokens = text.split("/")[1:]
+    if tokens:
+        first = tokens[0]
+        lowered = first.lower()
+        if lowered in _KEY_ALIASES:
+            tokens[0] = _KEY_ALIASES[lowered]
+        elif lowered in _TOP_LEVEL_KEYS:
+            tokens[0] = lowered
+    return "/" + "/".join(tokens)
 
 
 def resolve_pointer(data: Any, pointer: str) -> Any:
@@ -45,7 +88,7 @@ def _as_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
-def parse_evidence_json(raw: str) -> list[dict[str, Any]]:
+def parse_evidence_json(raw: str) -> list[dict[str, Any]]:  # noqa: C901
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else raw
     except json.JSONDecodeError as e:
@@ -60,7 +103,7 @@ def parse_evidence_json(raw: str) -> list[dict[str, Any]]:
         quote = item.get("quote", "")
         if not isinstance(pointer, str) or not isinstance(quote, str):
             raise EvidenceError(f"evidence item {i}: pointer and quote must be strings")
-        items.append({"pointer": pointer, "quote": quote})
+        items.append({"pointer": normalize_pointer(pointer), "quote": quote})
     return items
 
 
