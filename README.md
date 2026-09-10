@@ -165,6 +165,20 @@ worth knowing before relying on the system:
   by one in-flight minibatch; the application budget guard is the hard cap and
   ends the run in an explicit BUDGET_EXHAUSTED state.
 
+## Benchmark run on RAGTruth
+
+`docs/RAGTRUTH_RESULTS.md` reports a full run of the learning loop, committee
+selection, audits, and test-split scoring on RAGTruth's human hallucination labels
+with a real model, including the rounds that did not improve and the candidate the
+promotion rule refused. Reproduce with:
+
+```bash
+cd backend && uv sync --extra dev --extra benchmarks
+uv run python -c "from pathlib import Path; from eval_tinder.benchmarks.ragtruth import prepare; \
+  prepare(Path('artifacts/ragtruth'), train_parquet=Path('train.parquet'), test_parquet=Path('test.parquet'))"
+GRADING_CONCURRENCY=8 MAX_PROVIDER_CALLS_PER_JOB=3000 uv run python scripts/run_ragtruth_experiment.py
+```
+
 ## Portable grader
 
 ```bash
