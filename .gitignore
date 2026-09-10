@@ -16,3 +16,6 @@ frontend/dist/
 # misc
 *.log
 .DS_Store
+
+# runtime logs and launchers written by local runs
+backend/logs/
