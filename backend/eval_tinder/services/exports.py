@@ -235,19 +235,29 @@ def _judgment_row(j: HumanJudgment, t: TraceSnapshot | None) -> dict[str, Any]:
     }
 
 
-def _prediction_row(
-    r: GradingRun,
-    t: TraceSnapshot | None,
-    grader: GraderVersion | None,
-    statuses: dict[str, tuple[str, str]],
-) -> dict[str, Any]:
-    audit_status, automation_status = statuses.get(r.grader_id, ("UNAUDITED", AutomationState.DISABLED.value))
+def _grader_meta(session: Session, project: Project, graders: list[GraderVersion]) -> dict[str, dict[str, Any]]:
+    """Per-grader hashes and evidence status, computed once per export rather than once per prediction row."""
+    meta: dict[str, dict[str, Any]] = {}
+    for g in graders:
+        meta[g.id] = {
+            "manifest_hash": g.manifest_hash,
+            "pipeline_hash": pipeline_hash(GraderManifest.from_dict(g.manifest)),
+            "audit_status": audit_status_for(session, g),
+            "automation_status": automation_status_for(session, project, g),
+        }
+    return meta
+
+
+def _prediction_row(r: GradingRun, t: TraceSnapshot | None, meta: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    info = meta.get(r.grader_id, {})
+    audit_status = info.get("audit_status", "UNAUDITED")
+    automation_status = info.get("automation_status", AutomationState.DISABLED.value)
     return {
         "id": r.id,
         "kind": "MACHINE",
         "grader_id": r.grader_id,
-        "manifest_hash": grader.manifest_hash if grader else None,
-        "pipeline_hash": pipeline_hash(GraderManifest.from_dict(grader.manifest)) if grader else None,
+        "manifest_hash": info.get("manifest_hash"),
+        "pipeline_hash": info.get("pipeline_hash"),
         "trace_id": r.trace_id,
         "external_id": t.external_id if t else None,
         "group_id": t.group_id if t else None,
@@ -376,7 +386,7 @@ Exported at: {exported_at}
   `superseded_by` links; `is_active` marks the judgment currently in force for its policy epoch.
 - Audit material is sealed until an audit is COMPLETE or SPENT. Only the locked sample of such an
   audit is included, under `audit_samples/<audit_id>/`. The remainder of the AUDIT_RESERVE partition
-  is withheld ({withheld_groups} group(s) withheld; {withheld_audits} in-progress/invalidated audit(s) withheld).
+  is withheld (withheld reserve groups: {withheld_groups}; withheld in-progress/invalidated audits: {withheld_audits}).
 - Grader bundles contain prompt text and configuration only. No serialized program, pickle, or
   provider credential is included; configure credentials in the environment that grades.
 - Development agreement (`optimization_runs.json`) is a result on a frozen DEV snapshot, not evidence
@@ -463,10 +473,7 @@ def build_full_entries(session: Session, project: Project) -> dict[str, bytes]:
     released_audit_ids = {a.id for a in audits}
 
     graders = list_graders(session, project.id)
-    grader_by_id = {g.id: g for g in graders}
-    statuses = {
-        g.id: (audit_status_for(session, g), automation_status_for(session, project, g)) for g in graders
-    }
+    grader_meta = _grader_meta(session, project, graders)
 
     # Traces: latest TRAIN/DEV, browsable only.
     trace_rows = [_trace_row(t, assignments[t.group_id].partition if t.group_id in assignments else None)
@@ -518,7 +525,7 @@ def build_full_entries(session: Session, project: Project) -> dict[str, bytes]:
             continue
         if r.purpose == GradingPurpose.AUDIT and r.audit_run_id not in released_audit_ids:
             continue
-        prediction_rows.append(_prediction_row(r, all_traces.get(r.trace_id), grader_by_id.get(r.grader_id), statuses))
+        prediction_rows.append(_prediction_row(r, all_traces.get(r.trace_id), grader_meta))
 
     partition_rows = [
         _partition_row(a)

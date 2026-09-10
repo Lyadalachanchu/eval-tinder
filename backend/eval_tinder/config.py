@@ -72,6 +72,7 @@ class Settings(BaseSettings):
     job_lease_seconds: int = 120
     api_token: str | None = None  # single-expert local deployments may leave this unset (loopback only)
     reviewer_id: str = "local-expert"
+    cors_origins: list[str] = Field(default_factory=list)  # e.g. ["http://localhost:5173"]; empty = no CORS
 
     defaults: ProjectDefaults = Field(default_factory=ProjectDefaults)
 

@@ -72,7 +72,16 @@ def create_selection_round(
         )
     )
     if active is not None:
-        raise SelectionError(f"selection round {active.id} is already {active.state}")
+        job = session.get(Job, active.job_id) if active.job_id else None
+        if job is not None and job.state in job_service.TERMINAL_STATES:
+            # Bug fix: a round whose job already finished without completing the round (cancelled while QUEUED
+            # through the generic job endpoint, or failed after its last lease expired) can never run again, yet it
+            # stayed QUEUED/RUNNING and blocked every later round for the project. Finalize it instead of refusing.
+            active.state = SelectionRoundState.FAILED
+            active.error = f"job {job.id} finished as {job.state} before the round completed; no requests were created"
+            session.flush()
+        else:
+            raise SelectionError(f"selection round {active.id} is already {active.state}")
     rnd = SelectionRound(
         project_id=project.id,
         state=SelectionRoundState.QUEUED,
@@ -186,6 +195,30 @@ def labeled_strata_counts(session: Session, project: Project) -> dict[str, int]:
     return dict(counts)
 
 
+def _note_budget_exhaustion(report: dict[str, Any], budget: BudgetGuard, stage: str, **detail: Any) -> None:
+    """Record (once) that the provider budget ran out during ``stage``.
+
+    Bug fix: ``grader.runtime.grade`` turns ``BudgetExhausted`` into BUDGET_EXHAUSTED grading runs instead of
+    raising, so the ``except BudgetExhausted`` blocks in ``_run_round`` never fire for grading calls and an exhausted
+    round used to report full results with ``partial=False``. The guard's own flag is the reliable signal. Grading
+    is not aborted: cached verdicts remain valid votes, refused provider calls yield no vote, and a case without two
+    valid votes keeps a ``None`` disagreement score (never an invented one).
+    """
+    if not budget.exhausted or any(str(n.get("event", "")).startswith("budget_exhausted") for n in report["notes"]):
+        return
+    usage = budget.snapshot()
+    report["notes"].append(
+        {
+            "event": f"budget_exhausted_during_{stage}",
+            "reason": (
+                f"provider budget exhausted: calls={usage['calls']} (max {budget.max_calls}), "
+                f"tokens={usage['total_tokens']} (max {budget.max_total_tokens})"
+            ),
+            **detail,
+        }
+    )
+
+
 # ------------------------------------------------------------------ execution
 
 
@@ -231,6 +264,7 @@ def _run_round(s: Session, project: Project, rnd: SelectionRound, *, ctx, settin
         report["dev_snapshot_id"] = dev_snapshot.id
         candidates, graders, notes = gather_candidates(s, project, dev_snapshot, budget=budget, job_id=job_id, settings=settings)
         report["notes"].extend(notes)
+        _note_budget_exhaustion(report, budget, "shadow_evaluation")
         shortlist = shortlist_candidates(
             candidates, quality_gap=cfg.committee_quality_gap, max_shortlist=cfg.committee_max_shortlist
         )
@@ -253,11 +287,12 @@ def _run_round(s: Session, project: Project, rnd: SelectionRound, *, ctx, settin
                 runtime = GraderRuntime.build(project, graders[c.grader_id], settings=settings, budget=budget, lm=lm)
                 runs = grade_many(s, project, runtime, probe, purpose=GradingPurpose.PROBE, job_id=job_id, settings=settings)
                 probe_predictions[c.grader_id] = _predictions_map(runs)
+                _note_budget_exhaustion(report, budget, "probe", grader_id=c.grader_id)  # bug fix, see helper
                 if ctx is not None:
                     ctx.check_cancelled()
                     ctx.progress(stage="probe", graded=len(probe_predictions))
-        except BudgetExhausted as e:
-            report["notes"].append({"event": "budget_exhausted_during_probe", "reason": str(e)})
+        except BudgetExhausted:
+            _note_budget_exhaustion(report, budget, "probe")
         committee = form_committee(shortlist.shortlisted, probe_predictions, size=cfg.committee_size, min_shared=5)
         committee_members = list(committee.members)
         report["committee"] = {
@@ -289,11 +324,12 @@ def _run_round(s: Session, project: Project, rnd: SelectionRound, *, ctx, settin
                 runs = grade_many(s, project, runtime, pool_trace_objs, purpose=GradingPurpose.POOL, job_id=job_id, settings=settings)
                 for r in runs:
                     votes[r.trace_id].append(r.verdict if r.status == GradingStatus.OK else None)
+                _note_budget_exhaustion(report, budget, "pool", grader_id=gid)  # bug fix, see helper
                 if ctx is not None:
                     ctx.check_cancelled()
                     ctx.progress(stage="pool", graded_members=gid)
-        except BudgetExhausted as e:
-            report["notes"].append({"event": "budget_exhausted_during_pool", "reason": str(e)})
+        except BudgetExhausted:
+            _note_budget_exhaustion(report, budget, "pool")
         for tid, vs in votes.items():
             summary = vote_summary(vs)
             score = gini_disagreement(vs)

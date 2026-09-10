@@ -146,6 +146,12 @@ def create_run(
     active = _active_run(session, project.id)
     if active is not None:
         raise OptimizationError(f"run {active.id} is already {active.state}; wait for it to finish")
+    # A completed audit's results can now influence this revision: it becomes SPENT (historical report only).
+    from eval_tinder.services import audits as audit_service
+
+    audit_service.mark_completed_audits_spent(
+        session, project, reason=f"optimization run requested (idempotency_key={idempotency_key})"
+    )
     cfg = project_config(project)
     config = OptimizerConfig(
         max_metric_calls=request.max_metric_calls or cfg.gepa_max_metric_calls,
@@ -625,6 +631,10 @@ def select_shadow(session: Session, project: Project, grader_id: str, *, reason:
     project.configuration = {**(project.configuration or {}), "shadow_history": history}
     project.active_shadow_grader_id = grader_id
     session.flush()
+    # Enablement is bound to one exact pipeline hash: a different active pipeline invalidates it.
+    from eval_tinder.services import automation as automation_service
+
+    automation_service.invalidate_if_pipeline_changed(session, project)
     return project
 
 
@@ -671,3 +681,35 @@ def run_readiness(session: Session, project: Project) -> dict[str, Any]:
         "automatic_optimization": cfg.automatic_optimization,
         "note": "These are bootstrap counts, not sample-size guarantees.",
     }
+
+
+# ----------------------------------------------------------------- opt-in automatic rounds
+
+
+def maybe_auto_optimize(session: Session, project: Project, *, settings: Settings | None = None) -> OptimizationRun | None:
+    """Enqueue a new run when the project opted in and enough new TRAIN labels arrived.
+
+    Off by default (``automatic_optimization=false``). Respects configured budgets
+    and never runs while another run is queued or running. Returns the run when one
+    was created, else None.
+    """
+    cfg = project_config(project)
+    if not cfg.automatic_optimization:
+        return None
+    readiness = run_readiness(session, project)
+    if not readiness["bootstrap_ready"]:
+        return None
+    if readiness["last_run_id"] is not None and not readiness["ready_to_optimize_again"]:
+        return None
+    if _active_run(session, project.id) is not None:
+        return None
+    from eval_tinder.services.review import resolved_label_counts
+
+    counts = resolved_label_counts(session, project)
+    key = f"auto:{project.id}:{project.policy_epoch}:{counts['TRAIN']['resolved']}:{counts['DEV']['resolved']}"
+    try:
+        run, _job = create_run(session, project, RunRequest(label="automatic"), idempotency_key=key, settings=settings)
+    except OptimizationError as e:
+        log.info("automatic optimization skipped for project %s: %s", project.id, e)
+        return None
+    return run

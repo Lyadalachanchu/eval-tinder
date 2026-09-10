@@ -154,6 +154,11 @@ def submit(request_id: str, body: JudgmentCreate, db: Session = Depends(get_db),
         reviewer_id=user, shown_context_hash=body.shown_context_hash, active_review_ms=body.active_review_ms,
         idempotency_key=body.idempotency_key, owner=user,
     )
+    if j.purpose == "TRAIN":
+        from eval_tinder.services.optimization import maybe_auto_optimize
+
+        project = project_service.get_project(db, j.project_id)
+        maybe_auto_optimize(db, project)  # no-op unless the project opted in
     return judgment_out(j)
 
 

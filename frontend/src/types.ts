@@ -514,6 +514,7 @@ export interface AuditOut {
   correction_history?: unknown[]
   grading_job_id?: string | null
   created_at?: string
+  completed_at?: string | null
 }
 
 export interface AutomationPolicyOut {
@@ -522,6 +523,7 @@ export interface AutomationPolicyOut {
   audit_id?: string | null
   gate_result?: Dict | null
   reason?: string
+  note?: string
   history?: Dict[]
 }
 
@@ -535,6 +537,7 @@ export interface ExportOut {
   state: string
   job_id: string | null
   download_url?: string | null
+  error?: string | null
   created_at?: string
   [key: string]: unknown
 }

@@ -14,7 +14,16 @@ log = logging.getLogger(__name__)
 
 
 def create_app() -> FastAPI:
+    from eval_tinder.config import get_settings
+
     app = FastAPI(title="eval-tinder", version="0.1.0")
+    origins = get_settings().cors_origins
+    if origins:
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
+        )
 
     @app.exception_handler(NotFound)
     async def _not_found(request: Request, exc: NotFound):

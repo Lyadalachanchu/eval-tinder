@@ -11,7 +11,6 @@ from eval_tinder.api.schemas import CandidateOut, OptimizationRunCreate, Optimiz
 from eval_tinder.db.models import CandidateEvaluation, DatasetSnapshot, GraderVersion, OptimizationRun
 from eval_tinder.services import optimization as opt_service
 from eval_tinder.services import projects as project_service
-from eval_tinder.services.jobs import request_cancel
 
 router = APIRouter(tags=["optimization"], dependencies=[Depends(require_auth)])
 
@@ -106,10 +105,10 @@ def cancel_run(run_id: str, db: Session = Depends(get_db)):
     run = db.get(OptimizationRun, run_id)
     if run is None:
         raise project_service.NotFound(f"run {run_id} not found")
-    if run.job_id:
-        job = request_cancel(db, run.job_id)
-        if job.state == "CANCELLED" and run.state == "QUEUED":
-            run.state = "CANCELLED"
+    # Delegate to the service: a queued run is finalized there consistently (state, error, finished_at), a
+    # running run only receives a cooperative cancel request, and a finished run is left untouched. The
+    # router must not carry a second, partial copy of that rule.
+    opt_service.cancel_run(db, run)
     return run_out(db, run, with_candidates=False)
 
 

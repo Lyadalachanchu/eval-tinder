@@ -483,7 +483,9 @@ def predictions_for(
         wanted = set(trace_ids)
         hidden = wanted - {t.id for t in traces}
         if hidden:
-            raise BulkGradingError("requested trace(s) are not browsable: sealed or audit material")
+            raise BulkGradingError(
+                f"{len(hidden)} requested trace(s) are not browsable: unknown, sealed, quarantined, or audit material"
+            )
         traces = [t for t in traces if t.id in wanted]
     if not traces:
         return []
