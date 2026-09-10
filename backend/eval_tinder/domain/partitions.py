@@ -37,7 +37,9 @@ def validate_split(split: Mapping[str, float]) -> dict[str, float]:
     if keys != expected:
         missing = sorted(expected - keys)
         extra = sorted(keys - expected)
-        raise ValueError(f"split keys must be exactly {sorted(expected)}; missing={missing} unexpected={extra}")
+        raise ValueError(
+            f"split keys must be exactly {sorted(expected)}; missing={missing} unexpected={extra}"
+        )
     normalized: dict[str, float] = {}
     for name in PARTITIONS:
         raw = split[name]

@@ -18,6 +18,21 @@ METRIC_VERSION = "agreement-v1"
 MANIFEST_SCHEMA_VERSION = 1
 
 FORBIDDEN_MODEL_CONFIG_KEYS = {"api_key", "api_base_key", "authorization", "token", "secret", "password"}
+_FORBIDDEN_FRAGMENTS = ("api_key", "apikey", "authorization", "token", "secret", "password", "credential")
+
+
+def _is_credential_key(key: str) -> bool:
+    lowered = key.lower()
+    return lowered in FORBIDDEN_MODEL_CONFIG_KEYS or any(f in lowered for f in _FORBIDDEN_FRAGMENTS)
+
+
+def _strip_credentials(value: Any) -> Any:
+    """Recursively drop credential-like keys from nested provider settings."""
+    if isinstance(value, dict):
+        return {k: _strip_credentials(v) for k, v in value.items() if not _is_credential_key(str(k))}
+    if isinstance(value, list):
+        return [_strip_credentials(v) for v in value]
+    return value
 
 
 class ModelConfig(BaseModel):
@@ -28,8 +43,7 @@ class ModelConfig(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
 
     def sanitized(self) -> "ModelConfig":
-        extra = {k: v for k, v in self.extra.items() if k.lower() not in FORBIDDEN_MODEL_CONFIG_KEYS}
-        return self.model_copy(update={"extra": extra})
+        return self.model_copy(update={"extra": _strip_credentials(self.extra)})
 
 
 class GraderManifest(BaseModel):
@@ -60,9 +74,9 @@ class GraderManifest(BaseModel):
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "GraderManifest":
-        for key in list(d.get("model_config", {}).get("extra", {})):
-            if key.lower() in FORBIDDEN_MODEL_CONFIG_KEYS:
-                raise ValueError(f"Manifest may not carry credential-like key {key!r}")
+        extra = (d.get("model_config") or {}).get("extra") or {}
+        if _strip_credentials(extra) != extra:
+            raise ValueError("Manifest may not carry credential-like keys in model_config.extra")
         return cls.model_validate(d)
 
 

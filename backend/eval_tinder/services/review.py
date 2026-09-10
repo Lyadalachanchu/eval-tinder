@@ -67,7 +67,9 @@ class StaleSnapshot(ReviewError):
 # ---------------------------------------------------------------- exposure
 
 
-def record_exposure(session: Session, project_id: str, group_id: str, kind: str, reference_id: str | None) -> None:
+def record_exposure(
+    session: Session, project_id: str, group_id: str, kind: str, reference_id: str | None
+) -> None:
     session.add(ExposureEvent(project_id=project_id, group_id=group_id, kind=kind, reference_id=reference_id))
     assignment = session.scalar(
         select(PartitionAssignment).where(
@@ -112,7 +114,9 @@ def active_judgment_for(session: Session, trace_id: str, policy_epoch: int) -> H
     )
 
 
-def active_judgments(session: Session, project: Project, partition: str | None = None) -> list[tuple[TraceSnapshot, HumanJudgment]]:
+def active_judgments(
+    session: Session, project: Project, partition: str | None = None
+) -> list[tuple[TraceSnapshot, HumanJudgment]]:
     stmt = (
         select(TraceSnapshot, HumanJudgment)
         .join(HumanJudgment, HumanJudgment.trace_id == TraceSnapshot.id)
@@ -134,7 +138,9 @@ def active_judgments(session: Session, project: Project, partition: str | None =
 
 def resolved_label_counts(session: Session, project: Project) -> dict[str, dict[str, int]]:
     """Counts of active PASS/FAIL/CANNOT_JUDGE labels per partition at the current epoch."""
-    out: dict[str, dict[str, int]] = {p.value: {"PASS": 0, "FAIL": 0, "CANNOT_JUDGE": 0, "resolved": 0} for p in Partition}
+    out: dict[str, dict[str, int]] = {
+        p.value: {"PASS": 0, "FAIL": 0, "CANNOT_JUDGE": 0, "resolved": 0} for p in Partition
+    }
     for p in Partition:
         for _, j in active_judgments(session, project, p.value):
             out[p.value][j.verdict] += 1
@@ -307,7 +313,9 @@ def create_requests(
         )
         session.add(req)
         requests.append(req)
-        record_exposure(session, project.id, t.group_id, PURPOSE_TO_EXPOSURE[ReviewPurpose(purpose)], batch_id)
+        record_exposure(
+            session, project.id, t.group_id, PURPOSE_TO_EXPOSURE[ReviewPurpose(purpose)], batch_id
+        )
     session.flush()
     return requests
 
@@ -351,7 +359,9 @@ def get_request(session: Session, request_id: str, *, for_update: bool = False) 
     lock = {"of": ReviewRequest} if for_update else None
     req = session.get(ReviewRequest, request_id, with_for_update=lock)
     if req is None:
-        raise ReviewError(f"review request {request_id} not found")
+        from eval_tinder.services.projects import NotFound
+
+        raise NotFound(f"review request {request_id} not found")
     return req
 
 
@@ -433,7 +443,9 @@ def submit_judgment(
         raise ReviewError(f"invalid verdict {verdict!r}")
     if verdict == HumanVerdict.CANNOT_JUDGE:
         if cannot_judge_reason not in {r.value for r in CannotJudgeReason}:
-            raise ReviewError("CANNOT_JUDGE requires a category: MISSING_CONTEXT, AMBIGUOUS_POLICY, OUT_OF_SCOPE, OTHER")
+            raise ReviewError(
+                "CANNOT_JUDGE requires a category: MISSING_CONTEXT, AMBIGUOUS_POLICY, OUT_OF_SCOPE, OTHER"
+            )
     else:
         cannot_judge_reason = None
     trace = session.get(TraceSnapshot, req.trace_id)
@@ -495,7 +507,9 @@ def correct_judgment(
         raise ReviewError("judgment already superseded; correct the latest judgment")
     if verdict not in {v.value for v in HumanVerdict}:
         raise ReviewError(f"invalid verdict {verdict!r}")
-    if verdict == HumanVerdict.CANNOT_JUDGE and cannot_judge_reason not in {r.value for r in CannotJudgeReason}:
+    if verdict == HumanVerdict.CANNOT_JUDGE and cannot_judge_reason not in {
+        r.value for r in CannotJudgeReason
+    }:
         raise ReviewError("CANNOT_JUDGE requires a category")
     if verdict != HumanVerdict.CANNOT_JUDGE:
         cannot_judge_reason = None
@@ -530,6 +544,8 @@ def reveal_allowed(req: ReviewRequest) -> bool:
 
 def count_states(session: Session, project_id: str) -> dict[str, int]:
     rows = session.execute(
-        select(ReviewRequest.state, func.count()).where(ReviewRequest.project_id == project_id).group_by(ReviewRequest.state)
+        select(ReviewRequest.state, func.count())
+        .where(ReviewRequest.project_id == project_id)
+        .group_by(ReviewRequest.state)
     )
     return {state: n for state, n in rows}

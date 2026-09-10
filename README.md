@@ -140,6 +140,31 @@ Key rules the code enforces (see the plan's section 3):
   frozen pipeline when the predeclared gate passes; corrections and pipeline changes invalidate it.
 - Exports contain JSONL, JSON manifests, and reports only: no secrets, no sealed audit material, no pickles.
 
+## Verification and known limitations
+
+Every milestone's tests were re-run by independent adversarial reviewers (mutation
+checks, throwaway probes) whose confirmed findings were fixed and covered by
+regression tests in `backend/tests/integration/test_verifier_fixes.py`. Points
+worth knowing before relying on the system:
+
+- **Random review slots and context repair.** Random slots are drawn before any
+  disagreement score is consulted, but cases whose committee votes were all
+  REVIEW are routed to context repair first, so the random draw is conditional
+  on that routing. Random exploration never replaces the independent audit.
+- **Contrary audits.** A released audit of the same pipeline and policy epoch
+  whose gate failed blocks enablement unless its risk targets were strictly
+  tighter than the enabling audit's. Re-sampling the reserve until a pass is
+  refused by design.
+- **Simulated expert.** The demo's `--simulate-expert` labels and the experiment
+  runner's expert come from the fixture truth table. They are marked as simulated
+  and are not expert evidence; the experiment reports ties and regressions as
+  measured.
+- **Synthetic data never enters an audit.** The demo fixture is SYNTHETIC, so the
+  audit screen needs PRODUCTION-sourced imports before a sample can be locked.
+- **Metric-call budgets are approximate.** GEPA may overshoot `max_metric_calls`
+  by one in-flight minibatch; the application budget guard is the hard cap and
+  ends the run in an explicit BUDGET_EXHAUSTED state.
+
 ## Portable grader
 
 ```bash

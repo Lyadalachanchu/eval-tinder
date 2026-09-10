@@ -100,14 +100,17 @@ class GraderRuntime:
 
 
 def _assert_not_sealed(session: Session, trace: TraceSnapshot, purpose: str) -> None:
-    if purpose == GradingPurpose.AUDIT:
-        return
     assignment = session.scalar(
         select(PartitionAssignment).where(
             PartitionAssignment.project_id == trace.project_id, PartitionAssignment.group_id == trace.group_id
         )
     )
-    if assignment is not None and assignment.exposure_status in (ExposureStatus.SEALED, ExposureStatus.QUARANTINED):
+    if assignment is not None and assignment.exposure_status == ExposureStatus.QUARANTINED:
+        # Quarantined evidence (cross-partition duplicates) is invalid for every purpose, audits included.
+        raise SealedMaterial(f"group {trace.group_id} is QUARANTINED; not available for {purpose}")
+    if purpose == GradingPurpose.AUDIT:
+        return  # the audit service grades its own sealed sample
+    if assignment is not None and assignment.exposure_status == ExposureStatus.SEALED:
         raise SealedMaterial(f"group {trace.group_id} is {assignment.exposure_status}; not available for {purpose}")
     if assignment is not None and assignment.partition == "AUDIT_RESERVE" and purpose != GradingPurpose.EXPERIMENT:
         raise SealedMaterial(f"AUDIT_RESERVE material is not available for {purpose}")
@@ -169,7 +172,8 @@ def grade_trace(
         audit_run_id=audit_run_id,
     )
     session.add(run)
-    _record_purpose_exposure(session, project, trace, purpose, job_id)
+    if result.status != GradingStatus.BUDGET_EXHAUSTED:  # a refused call never touched the model
+        _record_purpose_exposure(session, project, trace, purpose, job_id)
     session.flush()
     return run
 
@@ -197,14 +201,15 @@ def grade_many(
 ) -> list[GradingRun]:
     runs = []
     for i, trace in enumerate(traces):
-        runs.append(
-            grade_trace(
-                session, project, runtime, trace, purpose=purpose, job_id=job_id, audit_run_id=audit_run_id,
-                use_cache=use_cache, settings=settings,
-            )
+        run = grade_trace(
+            session, project, runtime, trace, purpose=purpose, job_id=job_id, audit_run_id=audit_run_id,
+            use_cache=use_cache, settings=settings,
         )
+        runs.append(run)
         if on_progress is not None:
             on_progress(i + 1)
+        # Once the budget is spent, later traces still get cache hits (free) or a BUDGET_EXHAUSTED record
+        # without any model call and without an exposure event.
     return runs
 
 

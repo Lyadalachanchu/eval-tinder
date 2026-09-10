@@ -63,9 +63,17 @@ def get_snapshot(session: Session, snapshot_id: str) -> DatasetSnapshot:
 
 
 def snapshot_rows(session: Session, snapshot: DatasetSnapshot) -> list[tuple[TraceSnapshot, HumanJudgment]]:
-    traces = {t.id: t for t in session.scalars(select(TraceSnapshot).where(TraceSnapshot.id.in_(snapshot.ordered_trace_ids)))}
+    traces = {
+        t.id: t
+        for t in session.scalars(
+            select(TraceSnapshot).where(TraceSnapshot.id.in_(snapshot.ordered_trace_ids))
+        )
+    }
     judgments = {
-        j.id: j for j in session.scalars(select(HumanJudgment).where(HumanJudgment.id.in_(snapshot.ordered_judgment_ids)))
+        j.id: j
+        for j in session.scalars(
+            select(HumanJudgment).where(HumanJudgment.id.in_(snapshot.ordered_judgment_ids))
+        )
     }
     rows = []
     for tid, jid in zip(snapshot.ordered_trace_ids, snapshot.ordered_judgment_ids, strict=True):
@@ -77,7 +85,13 @@ def snapshot_cases(session: Session, snapshot: DatasetSnapshot) -> list[LabeledC
     cases = []
     for i, (t, j) in enumerate(snapshot_rows(session, snapshot)):
         cases.append(
-            LabeledCase(index=i, case=render_trace(t), label=j.verdict, explanation=j.explanation, partition=snapshot.partition)
+            LabeledCase(
+                index=i,
+                case=render_trace(t),
+                label=j.verdict,
+                explanation=j.explanation,
+                partition=snapshot.partition,
+            )
         )
     return cases
 

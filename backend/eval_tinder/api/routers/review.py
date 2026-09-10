@@ -104,7 +104,9 @@ def list_requests(
         stmt = stmt.where(ReviewRequest.state == state)
     if purpose:
         stmt = stmt.where(ReviewRequest.purpose == purpose)
-    stmt = stmt.where(ReviewRequest.purpose != "AUDIT") if purpose != "AUDIT" else stmt
+    if purpose == "AUDIT":
+        raise review_service.ReviewError("audit review requests are only served through /audits/{id}/next-review")
+    stmt = stmt.where(ReviewRequest.purpose != "AUDIT")
     rows = db.scalars(stmt.order_by(ReviewRequest.created_at).limit(limit))
     return [request_out(r, reveal=review_service.reveal_allowed(r)) for r in rows]
 
@@ -164,6 +166,23 @@ def submit(request_id: str, body: JudgmentCreate, db: Session = Depends(get_db),
 
 @router.post("/judgments/{judgment_id}/corrections", response_model=JudgmentOut, status_code=201)
 def correct(judgment_id: str, body: CorrectionCreate, db: Session = Depends(get_db), user: str = Depends(require_auth)):
+    prior = db.get(HumanJudgment, judgment_id)
+    if prior is None:
+        raise project_service.NotFound(f"judgment {judgment_id} not found")
+    if prior.purpose == "AUDIT":
+        # Audit corrections must invalidate the derived report and any dependent enablement.
+        from eval_tinder.db.models import AuditRun
+        from eval_tinder.services import audits as audit_service
+
+        req = db.get(ReviewRequest, prior.review_request_id) if prior.review_request_id else None
+        audit = db.get(AuditRun, req.audit_run_id) if req is not None and req.audit_run_id else None
+        if audit is None:
+            raise review_service.ReviewError("audit judgment is not linked to an audit; correct it through the audit API")
+        j = audit_service.correct_audit_judgment(
+            db, audit, judgment_id, verdict=body.verdict, explanation=body.explanation,
+            cannot_judge_reason=body.cannot_judge_reason, reviewer_id=user, idempotency_key=body.idempotency_key,
+        )
+        return judgment_out(j)
     j = review_service.correct_judgment(
         db, judgment_id, verdict=body.verdict, explanation=body.explanation, cannot_judge_reason=body.cannot_judge_reason,
         reviewer_id=user, idempotency_key=body.idempotency_key,

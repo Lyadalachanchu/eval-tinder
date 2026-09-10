@@ -22,7 +22,7 @@ class SelectionRoundCreate(BaseModel):
 def create_round(project_id: str, body: SelectionRoundCreate, db: Session = Depends(get_db)):
     project = project_service.get_project(db, project_id)
     rnd, job = selection_service.create_selection_round(db, project, seed=body.seed, idempotency_key=body.idempotency_key)
-    view = selection_service.round_view(rnd)
+    view = selection_service.round_view(rnd, db)
     view["job_id"] = job.id
     return view
 
@@ -31,7 +31,7 @@ def create_round(project_id: str, body: SelectionRoundCreate, db: Session = Depe
 def list_rounds(project_id: str, db: Session = Depends(get_db)):
     project_service.get_project(db, project_id)
     rows = db.scalars(select(SelectionRound).where(SelectionRound.project_id == project_id).order_by(SelectionRound.created_at.desc()))
-    return [selection_service.round_view(r) for r in rows]
+    return [selection_service.round_view(r, db) for r in rows]
 
 
 @router.get("/selection-rounds/{round_id}")
@@ -39,4 +39,4 @@ def get_round(round_id: str, db: Session = Depends(get_db)):
     rnd = db.get(SelectionRound, round_id)
     if rnd is None:
         raise project_service.NotFound(f"selection round {round_id} not found")
-    return selection_service.round_view(rnd)
+    return selection_service.round_view(rnd, db)

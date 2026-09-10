@@ -63,6 +63,10 @@ def bump_policy_epoch(session: Session, project: Project, *, reason: str) -> Pro
     history.append({"epoch": project.policy_epoch, "reason": reason})
     project.configuration = {**(project.configuration or {}), "policy_epoch_history": history}
     session.flush()
+    # A changed policy disables reuse of any prior enablement.
+    from eval_tinder.services import automation as automation_service
+
+    automation_service.invalidate_if_pipeline_changed(session, project)
     return project
 
 

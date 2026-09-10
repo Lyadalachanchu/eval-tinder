@@ -426,7 +426,9 @@ def test_sample_is_fixed_skips_are_reported_and_never_replaced(db_session, sessi
     assert report["complete"] is False
     assert (report["planned_n"], report["locked_n"], report["judged_n"], report["skipped_n"], report["pending_n"]) == (20, 20, 5, 1, 14)
     skipped_entries = [e for e in report["human_unresolved"] if e["request_state"] == "SKIPPED"]
-    assert len(skipped_entries) == 1 and skipped_entries[0]["trace_id"] == skipped_req.trace_id
+    # While the audit is in review, case details (trace ids, machine verdicts) are withheld from the report.
+    assert len(skipped_entries) == 1 and "trace_id" not in skipped_entries[0]
+    assert report["case_details_withheld"] is True
     assert "skipped" in skipped_entries[0]["reason"] and "no replacement" in skipped_entries[0]["reason"]
     assert sum(1 for e in report["human_unresolved"] if e["reason"] == "no judgment") == 14
     assert report["gate"]["passed"] is False and "audit_complete" in report["gate"]["failed"]

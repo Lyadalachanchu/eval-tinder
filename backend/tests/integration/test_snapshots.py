@@ -25,7 +25,7 @@ from eval_tinder.domain.partitions import DEFAULT_SPLIT, assign_partition
 from eval_tinder.domain.rendering import render_trace
 from eval_tinder.ids import new_id, sha256_hex
 from eval_tinder.services.imports import import_jsonl_sync
-from eval_tinder.services.projects import create_project
+from eval_tinder.services.projects import bump_policy_epoch, create_project
 from eval_tinder.services.review import (
     correct_judgment,
     create_requests,
@@ -270,6 +270,51 @@ def test_freeze_snapshot_is_deterministic_and_hash_tracks_label_changes(db_sessi
     fourth = freeze_snapshot(db_session, project, Partition.TRAIN)
     assert restored.id in fourth.ordered_judgment_ids
     assert fourth.content_hash not in {first.content_hash, third.content_hash}
+
+
+def test_freeze_snapshot_uses_only_active_judgments_of_the_current_policy_epoch(db_session):
+    """A policy-epoch bump revalidates labels: the old epoch's judgments never leak into a new snapshot."""
+    project = new_project(db_session)
+    groups = import_groups(db_session, project, train=3)
+    t_relabeled, t_stale, t_fresh = (latest_trace(db_session, project, g) for g in groups["TRAIN"])
+    old_relabeled = label(db_session, project, t_relabeled, explanation="epoch 1")
+    old_stale = label(db_session, project, t_stale, explanation="epoch 1")
+    epoch1 = freeze_snapshot(db_session, project, Partition.TRAIN)
+    assert epoch1.policy_epoch == 1
+    assert sorted(epoch1.ordered_judgment_ids) == sorted([old_relabeled.id, old_stale.id])
+
+    bump_policy_epoch(db_session, project, reason="the expert now grades truthful status reporting")
+    assert project.policy_epoch == 2
+    # Nothing has been revalidated yet: the new epoch starts empty instead of inheriting old labels.
+    empty = freeze_snapshot(db_session, project, Partition.TRAIN)
+    assert empty.policy_epoch == 2
+    assert empty.ordered_trace_ids == [] and empty.ordered_judgment_ids == []
+    assert empty.content_hash != epoch1.content_hash
+
+    # Revalidate one old label (same verdict, new epoch) and add a brand-new one; leave t_stale alone.
+    new_relabeled = label(db_session, project, t_relabeled, explanation="epoch 2")
+    new_fresh = label(db_session, project, t_fresh, explanation="epoch 2")
+    assert new_relabeled.policy_epoch == new_fresh.policy_epoch == 2
+    assert new_relabeled.verdict == old_relabeled.verdict
+    # Epochs never supersede each other; the epoch-1 row stays the active label *of epoch 1*.
+    assert new_relabeled.supersedes_id is None and old_relabeled.superseded_by_id is None
+
+    snapshot = freeze_snapshot(db_session, project, Partition.TRAIN)
+    assert snapshot.policy_epoch == 2
+    expected = sorted([(t_relabeled.id, new_relabeled.id), (t_fresh.id, new_fresh.id)])
+    assert snapshot.ordered_trace_ids == [tid for tid, _ in expected]
+    assert snapshot.ordered_judgment_ids == [jid for _, jid in expected]
+    assert old_relabeled.id not in snapshot.ordered_judgment_ids  # same trace, same verdict, old epoch
+    assert old_stale.id not in snapshot.ordered_judgment_ids and t_stale.id not in snapshot.ordered_trace_ids
+    assert all(j.policy_epoch == 2 for _, j in snapshot_rows(db_session, snapshot))
+    assert snapshot.content_hash != epoch1.content_hash
+    assert snapshot.content_hash != empty.content_hash
+    # The epoch-1 snapshot is untouched by the bump and by the epoch-2 labels.
+    db_session.expire_all()
+    reloaded = get_snapshot(db_session, epoch1.id)
+    assert reloaded.policy_epoch == 1
+    assert sorted(reloaded.ordered_judgment_ids) == sorted([old_relabeled.id, old_stale.id])
+    assert all(j.policy_epoch == 1 for _, j in snapshot_rows(db_session, reloaded))
 
 
 def test_assert_disjoint_raises_on_overlap(db_session):

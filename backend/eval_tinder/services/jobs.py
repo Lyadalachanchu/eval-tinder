@@ -28,6 +28,23 @@ class LeaseLost(JobError):
     pass
 
 
+def find_existing(session: Session, idempotency_key: str, *, project_id: str | None, kind: str) -> Job | None:
+    """Return the job previously created with this key, or raise when the key belongs elsewhere.
+
+    Idempotency keys are scoped to a project and job kind: replaying a key from another project or
+    another kind must never hand back a foreign job.
+    """
+    existing = session.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+    if existing is None:
+        return None
+    if existing.project_id != project_id or existing.kind != kind:
+        raise JobError(
+            f"idempotency_key {idempotency_key!r} was already used for a {existing.kind} job"
+            + (" of another project" if existing.project_id != project_id else "")
+        )
+    return existing
+
+
 def enqueue(
     session: Session,
     *,
@@ -38,7 +55,7 @@ def enqueue(
     payload_ref: str | None = None,
     max_attempts: int = 3,
 ) -> Job:
-    existing = session.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+    existing = find_existing(session, idempotency_key, project_id=project_id, kind=kind)
     if existing is not None:
         return existing
     job = Job(

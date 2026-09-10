@@ -19,7 +19,14 @@ import dspy
 from dspy.clients.base_lm import BaseLM
 
 from eval_tinder.gepa.metric import agreement_metric
-from eval_tinder.gepa.results import CandidateRecord, OptimizationOutcome, candidates_from_json, extract_outcome
+from eval_tinder.gepa.results import (
+    STOP_BUDGET_EXHAUSTED,
+    STOP_CANCELLED,
+    CandidateRecord,
+    OptimizationOutcome,
+    candidates_from_json,
+    extract_outcome,
+)
 from eval_tinder.grader.signature import build_module
 from eval_tinder.llm.budget import BudgetExhausted, BudgetGuard
 from eval_tinder.llm.factory import MeteredLM
@@ -173,9 +180,16 @@ class GepaOptimizerService:
             # Aborted mid-evaluation: only instruction texts are trustworthy; scores are unknown.
             return self._salvage(run_dir, seed_instructions, budget, reason=str(e))
         outcome = extract_outcome(optimized.detailed_results, usage=budget.snapshot())
+        # The stop reason is structured (``stop_reason``) so callers never have to parse the message: the
+        # cancellation text below mentions the budget and used to be misread as an exhaustion by substring.
         if stopper.fired == "cancelled":
             outcome.partial = True
+            outcome.stop_reason = STOP_CANCELLED
             outcome.partial_reason = "cancelled before the metric-call budget was spent"
+        elif stopper.fired == "budget_exhausted":
+            outcome.partial = True
+            outcome.stop_reason = STOP_BUDGET_EXHAUSTED
+            outcome.partial_reason = "provider budget exhausted; GEPA stopped between iterations"
         _write_json(run_dir / "outcome.json", _outcome_json(outcome))
         return outcome
 
@@ -204,6 +218,7 @@ class GepaOptimizerService:
             usage=budget.snapshot(),
             partial=True,
             partial_reason=reason,
+            stop_reason=STOP_BUDGET_EXHAUSTED,
         )
 
 
@@ -243,9 +258,13 @@ class FakeOptimizerService:
         texts = [seed_instructions] + [t for t in self.candidate_texts if t != seed_instructions]
         metered = MeteredLM(grading_lm, budget, role="grading")
         records: list[CandidateRecord] = []
+        cancelled = False
         try:
             for i, text in enumerate(texts):
                 if cancellation is not None and cancellation.cancelled and i > 0:
+                    # Cooperative stop between candidates, like GEPA between iterations: the candidates
+                    # evaluated so far are returned as a *partial* outcome (never as a completed run).
+                    cancelled = True
                     break
                 module = build_module(text)
                 subs: dict[int, float] = {}
@@ -268,7 +287,9 @@ class FakeOptimizerService:
                 candidates=records or [CandidateRecord(0, seed_instructions, [], None, {})],
                 best_index=None, instance_best_members={}, total_metric_calls=None, num_full_val_evals=None,
                 log_dir=str(run_dir), seed=config.seed, usage=budget.snapshot(), partial=True, partial_reason=str(e),
+                stop_reason=STOP_BUDGET_EXHAUSTED,
             )
+        cancelled = cancellation is not None and cancellation.cancelled and len(records) < len(texts)
         best = max(range(len(records)), key=lambda i: (records[i].val_aggregate_score or 0.0, -i))
         members: dict[int, list[int]] = {}
         for j in range(len(dev)):
@@ -279,6 +300,12 @@ class FakeOptimizerService:
             total_metric_calls=len(records) * len(dev), num_full_val_evals=len(records),
             log_dir=str(run_dir), seed=config.seed, usage=budget.snapshot(),
         )
+        if cancelled:
+            outcome.partial = True
+            outcome.stop_reason = STOP_CANCELLED
+            outcome.partial_reason = (
+                f"cancelled after {len(records)} of {len(texts)} candidates; the metric-call budget was not spent"
+            )
         _write_json(run_dir / "outcome.json", _outcome_json(outcome))
         return outcome
 
@@ -304,6 +331,7 @@ def _outcome_json(outcome: OptimizationOutcome) -> dict[str, Any]:
         "usage": outcome.usage,
         "partial": outcome.partial,
         "partial_reason": outcome.partial_reason,
+        "stop_reason": outcome.stop_reason,
     }
 
 

@@ -74,6 +74,9 @@ FORBIDDEN_MEMBER_SUFFIXES = (".pkl", ".pickle", ".bin", ".pt", ".pth", ".joblib"
 SECRET_PATTERNS = (
     re.compile(r"api[_-]?key", re.IGNORECASE),
     re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8,}"),
+    re.compile(r"\bauthorization\b", re.IGNORECASE),
+    re.compile(r"\bbearer\s+[A-Za-z0-9._-]{6,}", re.IGNORECASE),
+    re.compile(r"(access|auth|secret)[_-]?token", re.IGNORECASE),
 )
 TEXT_SUFFIXES = (".json", ".jsonl", ".md", ".txt")
 
@@ -707,7 +710,7 @@ def create_export(
     settings: Settings | None = None,
 ) -> tuple[ExportBundle, Job]:
     settings = settings or get_settings()
-    existing = session.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+    existing = job_service.find_existing(session, idempotency_key, project_id=project.id, kind=JobKind.EXPORT)
     if existing is not None:
         bundle = session.get(ExportBundle, existing.payload_ref)
         if bundle is None:

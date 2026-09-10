@@ -96,11 +96,13 @@ def test_selection_round_lifecycle_through_the_api(client, worker, db_session, s
     assert done["probe_size"] == done["pool_size"] == 14
     assert done["context_repair"] == [fx.trace_ids[fx.unclear]]
     assert "not a calibrated error probability" in done["note"]
-    categories = {e["category"] for e in done["selected_requests"]}
-    assert categories <= {"DISAGREEMENT", "COVERAGE", "RANDOM"} and "DISAGREEMENT" in categories
+    # Per-request categories stay hidden until the expert has judged that request (blind review);
+    # only aggregate counts are visible.
+    assert {e["category"] for e in done["selected_requests"]} == {"HIDDEN"}
+    assert done["category_counts"].get("DISAGREEMENT", 0) >= 1
     assert all(e["expected_reading_length"] > 0 and e["request_id"] and e["trace_id"] for e in done["selected_requests"])
     demo_entry = next(e for e in done["selected_requests"] if e["trace_id"] == fx.trace_ids[fx.demo])
-    assert demo_entry["category"] == "DISAGREEMENT"
+    assert demo_entry["category"] == "HIDDEN" and demo_entry["state"] == "OPEN"
     job = client.get(f"/jobs/{queued['job_id']}").json()
     assert job["state"] == "SUCCEEDED" and job["result"]["partial"] is False
     assert job["result"]["round_id"] == done["id"] and job["result"]["batch_size"] == 10

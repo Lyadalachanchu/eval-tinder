@@ -214,6 +214,21 @@ def set_policy(
         not scope_problems,
         "; ".join(scope_problems) if scope_problems else "scope equals or narrows the audited population",
     )
+    # The stored report must still describe the currently active judgments: a correction made through
+    # any path (not only the audit endpoint) changes the judgment set, so recompute and compare.
+    fresh_ok, fresh_detail = _report_is_fresh(session, audit)
+    check("report_fresh", fresh_ok, fresh_detail)
+    # Enablement binds to the deployed pipeline: the active shadow grader must be the audited one.
+    shadow_ok, shadow_detail = _active_shadow_matches(session, project, audit)
+    check("active_shadow_is_audited_pipeline", shadow_ok, shadow_detail)
+    # No sample shopping: a released audit of the same pipeline and epoch whose gate failed is contrary evidence.
+    contrary = _contrary_released_audits(session, project, audit)
+    check(
+        "no_contrary_released_audit",
+        not contrary,
+        f"released audit(s) of this pipeline failed their gate: {contrary}" if contrary
+        else "no released audit of this pipeline and epoch failed its gate",
+    )
     passed = all(c["passed"] for c in checks)
     failed = [c["name"] for c in checks if not c["passed"]]
 
@@ -241,6 +256,99 @@ def set_policy(
     project.automation_policy_id = policy.id
     session.flush()
     return policy
+
+
+def _report_is_fresh(session: Session, audit: AuditRun) -> tuple[bool, str]:
+    from eval_tinder.services import audits as audit_service
+
+    stored = audit.report if isinstance(audit.report, Mapping) else None
+    if not stored:
+        return False, "the audit has no stored report"
+    try:
+        current = audit_service.compute_report(session, audit)
+    except Exception as e:  # noqa: BLE001
+        return False, f"could not recompute the report: {e}"
+    stored_ids = list(stored.get("judgment_ids") or [])
+    current_ids = list(current.get("judgment_ids") or [])
+    if stored_ids != current_ids:
+        return False, "the stored report no longer matches the active audit judgments; recompute the audit"
+    stored_gate = bool((stored.get("gate") or {}).get("passed"))
+    current_gate = bool((current.get("gate") or {}).get("passed"))
+    if stored_gate != current_gate:
+        return False, "the stored gate result differs from a fresh recomputation; recompute the audit"
+    return True, "stored report matches the active judgments"
+
+
+def _active_shadow_matches(session: Session, project: Project, audit: AuditRun) -> tuple[bool, str]:
+    if not project.active_shadow_grader_id:
+        return False, "no active shadow grader; select the audited grader before enabling"
+    shadow = session.get(GraderVersion, project.active_shadow_grader_id)
+    if shadow is None:
+        return False, "active shadow grader not found"
+    shadow_hash = pipeline_hash(GraderManifest.from_dict(shadow.manifest))
+    if shadow_hash != audit.pipeline_hash:
+        return False, "the active shadow grader is not the audited pipeline"
+    return True, "the active shadow grader is the audited pipeline"
+
+
+def _contrary_released_audits(session: Session, project: Project, audit: AuditRun) -> list[str]:
+    rows = session.scalars(
+        select(AuditRun).where(
+            AuditRun.project_id == project.id,
+            AuditRun.pipeline_hash == audit.pipeline_hash,
+            AuditRun.policy_epoch == audit.policy_epoch,
+            AuditRun.id != audit.id,
+            AuditRun.state.in_([AuditState.COMPLETE.value, AuditState.SPENT.value]),
+        )
+    )
+    mine = audit.risk_targets or {}
+    contrary = []
+    for other in rows:
+        report = other.report if isinstance(other.report, Mapping) else {}
+        gate = report.get("gate") or {}
+        if not report or gate.get("passed"):
+            continue
+        # A failure under a STRICTER target is not evidence against this (looser) gate; a failure under
+        # the same or a looser target is contrary evidence (re-sampling until a pass is sample shopping).
+        theirs = other.risk_targets or {}
+        stricter = _targets_stricter(theirs, mine)
+        if not stricter:
+            contrary.append(other.id)
+    return contrary
+
+
+def _targets_stricter(theirs: Mapping[str, Any], mine: Mapping[str, Any]) -> bool:
+    """True when ``theirs`` demands more than ``mine`` on at least one gated quantity and less on none."""
+
+    def _num(d: Mapping[str, Any], key: str) -> float | None:
+        v = d.get(key)
+        return float(v) if isinstance(v, (int, float)) else None
+
+    tighter = False
+    for key, lower_is_stricter in (("max_error_rate", True), ("gate_false_pass_rate", True), ("min_coverage", False),
+                                   ("confidence", False)):
+        a, b = _num(theirs, key), _num(mine, key)
+        if a is None or b is None:
+            continue
+        if lower_is_stricter:
+            if a > b:
+                return False
+            if a < b:
+                tighter = True
+        else:
+            if a < b:
+                return False
+            if a > b:
+                tighter = True
+    return tighter
+
+
+def invalidate_for_pipeline_failure(session: Session, project: Project, pipeline_hash_value: str, reason: str) -> AutomationPolicy | None:
+    """A released audit whose gate failed revokes an ENABLED policy for that pipeline hash."""
+    policy = current_policy(session, project)
+    if policy is None or policy.state != AutomationState.ENABLED.value or policy.pipeline_hash != pipeline_hash_value:
+        return None
+    return _invalidate(session, policy, reason=reason, action="invalidate_contrary_audit")
 
 
 def _invalidate(session: Session, policy: AutomationPolicy, *, reason: str, action: str) -> AutomationPolicy:

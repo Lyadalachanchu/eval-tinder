@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from eval_tinder.config import Settings, get_settings
@@ -74,7 +74,7 @@ from eval_tinder.domain.metrics import (
     error_upper_bound,
     sampling_design_supported,
 )
-from eval_tinder.ids import utcnow
+from eval_tinder.ids import hash_value, utcnow
 from eval_tinder.services import jobs as job_service
 from eval_tinder.services import review as review_service
 from eval_tinder.services.grading import GraderRuntime, grade_many, new_guard
@@ -400,8 +400,19 @@ def lock_audit(
     settings = settings or get_settings()
     if not idempotency_key:
         raise AuditError("idempotency_key is required")
+    # Serialize concurrent locks per project so two audits can never sample the same untouched groups.
+    session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": f"audit-lock:{project.id}"})
+    fingerprint = hash_value(
+        {"grader_id": grader_id, "planned_n": planned_n, "seed": seed, "population": population,
+         "sampling_plan": sampling_plan, "risk_targets": risk_targets}
+    )
     existing = _find_by_idempotency_key(session, project, idempotency_key)
     if existing is not None:
+        if (existing.sampling_plan or {}).get("request_fingerprint") not in (None, fingerprint):
+            raise AuditError(
+                f"idempotency_key {idempotency_key!r} was already used for a different audit request; "
+                "use a new key for a new audit"
+            )
         job = session.get(Job, existing.grading_job_id) if existing.grading_job_id else None
         if job is None:
             raise AuditError(f"audit {existing.id} has no grading job")
@@ -463,6 +474,7 @@ def lock_audit(
             "planned_n": planned_n,
             "eligible_group_count": len(eligible),
             "idempotency_key": idempotency_key,
+            "request_fingerprint": fingerprint,
             "manifest_hash": grader.manifest_hash,
         },
         risk_targets=targets_spec,
@@ -738,6 +750,19 @@ def _report_body(session: Session, audit: AuditRun) -> dict[str, Any]:
     metrics = compute_metrics(table)
     locked_n = len(rows)
     complete = locked_n > 0 and judged == locked_n
+    judgment_ids = sorted(row.human.id for row in rows if row.human is not None)
+    if not complete:
+        # Blind review is still in progress: publish counts and reasons, never locked trace ids or the
+        # machine's verdicts on individual cases.
+        human_unresolved = [
+            {k: v for k, v in entry.items() if k not in ("trace_id", "judgment_id", "machine_verdict")}
+            for entry in human_unresolved
+        ]
+        operational = [{k: v for k, v in entry.items() if k != "trace_id"} for entry in operational]
+        unresolved_auto = []
+        withheld = True
+    else:
+        withheld = False
 
     supported, design_reason = sampling_design_supported(plan)
     confidence = float(targets["confidence"])
@@ -807,6 +832,8 @@ def _report_body(session: Session, audit: AuditRun) -> dict[str, Any]:
         "human_unresolved": human_unresolved,
         "unresolved_automatic_decisions": unresolved_auto,
         "operational_failures": operational,
+        "case_details_withheld": withheld,
+        "judgment_ids": judgment_ids,
         "intervals": intervals,
         "scope": {
             "population": population,
@@ -958,6 +985,14 @@ def persist_report(session: Session, audit: AuditRun) -> AuditRun:
     if new_state == AuditState.COMPLETE.value and (previous_state != AuditState.COMPLETE.value or audit.completed_at is None):
         audit.completed_at = now
     session.flush()
+    if new_state == AuditState.COMPLETE.value and not (report.get("gate") or {}).get("passed"):
+        from eval_tinder.services import automation as automation_service
+
+        project = session.get(Project, audit.project_id)
+        if project is not None:
+            automation_service.invalidate_for_pipeline_failure(
+                session, project, audit.pipeline_hash, reason=f"audit {audit.id} of this pipeline failed its gate"
+            )
     return audit
 
 
@@ -1046,7 +1081,10 @@ def mark_spent(session: Session, audit: AuditRun, *, reason: str) -> AuditRun:
 def mark_completed_audits_spent(session: Session, project: Project, *, reason: str) -> list[AuditRun]:
     spent = []
     for audit in list_audits(session, project.id):
-        if audit.state == AuditState.COMPLETE.value:
+        has_report = audit.report is not None
+        if audit.state == AuditState.COMPLETE.value or (
+            has_report and audit.state in (AuditState.INVALIDATED.value, AuditState.IN_REVIEW.value)
+        ):
             mark_spent(session, audit, reason=reason)
             spent.append(audit)
     return spent

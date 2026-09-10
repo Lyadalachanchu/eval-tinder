@@ -191,7 +191,7 @@ def test_seed_batch_and_blind_idempotent_judgments(client, worker):
     direct = client.get(f"/review-requests/{req['id']}").json()
     assert direct["predictions"] is None and direct["request"]["selection_reason"] is None
     assert direct["shown_context_hash"] == case["shown_context_hash"]
-    assert client.get("/review-requests/missing").status_code == 400
+    assert client.get("/review-requests/missing").status_code == 404
 
     stale = submit(client, case, key="stale-1", shown_context_hash="0" * 64)
     assert stale.status_code == 409, stale.text

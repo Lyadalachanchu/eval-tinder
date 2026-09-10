@@ -7,6 +7,9 @@ Rules
   the original group (group changes are refused).
 - An exact content duplicate under a new external_id is merged into the existing
   group so duplicates never straddle partitions.
+- A revision cannot be merged away (it keeps its group), so a revision whose new
+  content exactly duplicates a trace in another group is flagged; when the two
+  groups sit in different partitions both are quarantined.
 - Partition assignment is seeded per project and never rearranged.
 """
 from __future__ import annotations
@@ -27,6 +30,7 @@ from eval_tinder.domain.partitions import assign_partition, small_import_warning
 from eval_tinder.ids import hash_value
 from eval_tinder.services import jobs as job_service
 from eval_tinder.services.projects import project_config
+from eval_tinder.services.review import quarantine_group
 
 MAX_TEXT_CHARS = 200_000
 
@@ -107,7 +111,9 @@ def parse_jsonl(data: bytes | str, *, max_bytes: int | None = None) -> ParseResu
             result.errors.append({"line": line_no, "error": str(e)})
             continue
         if rec.external_id in seen_ids:
-            result.errors.append({"line": line_no, "error": f"duplicate external_id {rec.external_id!r} within upload"})
+            result.errors.append(
+                {"line": line_no, "error": f"duplicate external_id {rec.external_id!r} within upload"}
+            )
             continue
         seen_ids.add(rec.external_id)
         result.records.append(rec)
@@ -194,6 +200,64 @@ def ensure_partition(session: Session, project: Project, group_id: str) -> Parti
     return assignment
 
 
+def _assignment_for(session: Session, project: Project, group_id: str) -> PartitionAssignment | None:
+    return session.scalar(
+        select(PartitionAssignment).where(
+            PartitionAssignment.project_id == project.id, PartitionAssignment.group_id == group_id
+        )
+    )
+
+
+def _flag_revision_duplicate(
+    session: Session,
+    project: Project,
+    rec: ParsedRecord,
+    group_id: str,
+    content_hash: str,
+    counts: ImportCounts,
+) -> None:
+    """Flag a revision whose new content exactly duplicates a trace that lives in *another* group.
+
+    A fresh record with duplicate content is merged into the existing group (see ``import_records``),
+    but a revision keeps its original group, so the duplicate would otherwise appear in two groups
+    unnoticed. Like the merge path this looks at every stored revision, not only the latest ones.
+    A revert to the trace's own earlier content is not a duplicate (same group). When the two groups
+    sit in different partitions the shared evidence straddles them, so both groups are quarantined;
+    partitions themselves are never rearranged.
+    """
+    duplicate = session.scalar(
+        select(TraceSnapshot)
+        .where(
+            TraceSnapshot.project_id == project.id,
+            TraceSnapshot.content_hash == content_hash,
+            TraceSnapshot.group_id != group_id,
+        )
+        .order_by(TraceSnapshot.is_latest.desc(), TraceSnapshot.external_id)
+    )
+    if duplicate is None:
+        return
+    warning: dict[str, Any] = {
+        "line": rec.line,
+        "external_id": rec.external_id,
+        "warning": (
+            f"revision is an exact duplicate of {duplicate.external_id!r} in group {duplicate.group_id!r};"
+            f" the revision keeps group {group_id!r}"
+        ),
+    }
+    mine = _assignment_for(session, project, group_id)
+    theirs = _assignment_for(session, project, duplicate.group_id)
+    if mine is not None and theirs is not None and mine.partition != theirs.partition:
+        reason = (
+            f"cross-partition duplicate: {rec.external_id!r} ({group_id!r}, {mine.partition}) == "
+            f"{duplicate.external_id!r} ({duplicate.group_id!r}, {theirs.partition})"
+        )
+        quarantine_group(session, project.id, group_id, reason=reason)
+        quarantine_group(session, project.id, duplicate.group_id, reason=reason)
+        warning["warning"] += f"; both groups quarantined ({mine.partition} vs {theirs.partition})"
+        warning["quarantined_groups"] = sorted([group_id, duplicate.group_id])
+    counts.warnings.append(warning)
+
+
 def import_records(
     session: Session, project: Project, records: list[ParsedRecord], *, batch_id: str | None = None
 ) -> ImportCounts:
@@ -218,6 +282,9 @@ def import_records(
                      "warning": f"group change ignored; revision keeps group {latest.group_id!r}"}
                 )
             group_id = latest.group_id
+            # The revision cannot be merged into another group, so an exact duplicate elsewhere must be
+            # flagged here (and quarantined when it crosses partitions) instead of slipping through.
+            _flag_revision_duplicate(session, project, rec, group_id, content_hash, counts)
             latest.is_latest = False
             revision = latest.revision + 1
             counts.revised += 1
@@ -229,8 +296,14 @@ def import_records(
             )
             if duplicate is not None and duplicate.group_id != rec.group_id:
                 counts.warnings.append(
-                    {"line": rec.line, "external_id": rec.external_id,
-                     "warning": f"exact duplicate of {duplicate.external_id!r}; merged into group {duplicate.group_id!r}"}
+                    {
+                        "line": rec.line,
+                        "external_id": rec.external_id,
+                        "warning": (
+                            f"exact duplicate of {duplicate.external_id!r}; "
+                            f"merged into group {duplicate.group_id!r}"
+                        ),
+                    }
                 )
                 group_id = duplicate.group_id
                 counts.merged_duplicates += 1
@@ -269,7 +342,13 @@ def import_records(
         select(PartitionAssignment.id).where(PartitionAssignment.project_id == project.id).limit(1)
     )
     if total_groups is not None:
-        n = len(list(session.scalars(select(PartitionAssignment.group_id).where(PartitionAssignment.project_id == project.id))))
+        n = len(
+            list(
+                session.scalars(
+                    select(PartitionAssignment.group_id).where(PartitionAssignment.project_id == project.id)
+                )
+            )
+        )
         warning = small_import_warning(n, validate_split(project_config(project).partition_split))
         if warning:
             counts.warnings.append({"line": 0, "warning": warning})
@@ -289,7 +368,7 @@ def enqueue_import(
     settings: Settings | None = None,
 ) -> tuple[ImportBatch, Job]:
     settings = settings or get_settings()
-    existing_job = session.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+    existing_job = job_service.find_existing(session, idempotency_key, project_id=project.id, kind=JobKind.IMPORT)
     if existing_job is not None:
         batch = session.get(ImportBatch, existing_job.payload_ref)
         assert batch is not None
@@ -321,7 +400,9 @@ def run_import(session: Session, batch: ImportBatch) -> ImportBatch:
     return batch
 
 
-def import_jsonl_sync(session: Session, project: Project, data: bytes | str, *, filename: str = "inline.jsonl") -> ImportBatch:
+def import_jsonl_sync(
+    session: Session, project: Project, data: bytes | str, *, filename: str = "inline.jsonl"
+) -> ImportBatch:
     """Synchronous import (CLI, tests, demo seeding)."""
     batch = ImportBatch(project_id=project.id, filename=filename, state="RUNNING")
     session.add(batch)

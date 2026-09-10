@@ -159,13 +159,19 @@ def build_cli_lm(manifest, *, provider: Optional[str], model: Optional[str]):
     if provider not in ("fake", "litellm"):
         _fail(f"unknown provider {provider!r}; expected 'fake' or 'litellm'")
     if provider == "fake":
-        effective = ModelConfig(provider="fake", model=model or "fake-grader", temperature=0.0, max_tokens=base.max_tokens)
+        if base.provider == "fake" and (model or base.model) == base.model:
+            effective = base  # exactly the bundle's configuration: the pipeline hash can match
+        else:
+            effective = ModelConfig(provider="fake", model=model or "fake-grader", temperature=0.0, max_tokens=base.max_tokens)
         return ScriptedGradingLM(keyword_switch_policy, model=effective.model), effective
     if not model:
         _fail("a model id is required for provider 'litellm' (use --model or GRADER_MODEL)")
-    effective = ModelConfig(
-        provider="litellm", model=model, temperature=base.temperature, max_tokens=base.max_tokens, extra=base.extra
-    )
+    if base.provider == "litellm" and model == base.model:
+        effective = base
+    else:
+        effective = ModelConfig(
+            provider="litellm", model=model, temperature=base.temperature, max_tokens=base.max_tokens, extra=base.extra
+        )
     try:
         return build_grading_lm(effective), effective
     except ConfigurationError as e:
@@ -199,19 +205,25 @@ def grade(
     settings = get_settings()
     budget = max_case_chars if max_case_chars is not None else settings.max_case_chars
     lm, effective = build_cli_lm(manifest, provider=provider, model=model)
-    same_pipeline = (
-        effective.provider == manifest.model_config_.provider and effective.model == manifest.model_config_.model
+    # The pipeline that actually grades = bundle prompt + effective model + the RUNNING renderer/parser.
+    from eval_tinder.domain.manifest import PARSER_VERSION
+    from eval_tinder.domain.rendering import RENDERER_VERSION
+
+    effective_manifest = manifest.model_copy(
+        update={"model_config_": effective, "renderer_version": RENDERER_VERSION, "parser_version": PARSER_VERSION}
     )
+    effective_pipeline = pipeline_hash(effective_manifest)
+    same_pipeline = effective_pipeline == data.get("pipeline_hash")
     if not same_pipeline:
         _err(
-            f"warning: grading with {effective.provider}/{effective.model} instead of the bundle's "
-            f"{manifest.model_config_.provider}/{manifest.model_config_.model}: this is a different pipeline; "
-            "audit evidence and automation status of the bundle do not apply"
+            f"warning: effective pipeline {effective_pipeline[:12]} differs from the bundle's "
+            f"{str(data.get('pipeline_hash'))[:12]} (model {effective.provider}/{effective.model} vs bundle "
+            f"{manifest.model_config_.provider}/{manifest.model_config_.model}; renderer {RENDERER_VERSION} vs "
+            f"{manifest.renderer_version}; parser {PARSER_VERSION} vs {manifest.parser_version}): this is a different "
+            "pipeline. Audit evidence and automation status of the bundle do not apply; rows are UNAUDITED/DISABLED."
         )
     audit_status = bundle_audit_status(data) if same_pipeline else "UNAUDITED"
     automation_status = bundle_automation_status(data) if same_pipeline else AutomationState.DISABLED.value
-    effective_manifest = manifest.model_copy(update={"model_config_": effective})
-    effective_pipeline = pipeline_hash(effective_manifest)
 
     parsed = parse_jsonl(raw, max_bytes=max(len(raw), 1))
     for err in parsed.errors:
@@ -297,3 +309,49 @@ def export_grader(
 
 if __name__ == "__main__":  # pragma: no cover
     app()
+
+
+demo_app = typer.Typer(help="Seed and drive the synthetic cancellation demo.")
+app.add_typer(demo_app, name="demo")
+
+
+@demo_app.command("seed")
+def demo_seed(
+    name: str = typer.Option("Cancellation assistant (demo)", help="Project name."),
+    simulate_expert: bool = typer.Option(False, "--simulate-expert", help="Answer the seed/DEV batches from the fixture truth table."),
+    partition_seed: int = typer.Option(20260910, help="Seeded partition assignment."),
+) -> None:
+    """Create a demo project from backend/fixtures (SYNTHETIC data) with seed TRAIN and DEV review batches."""
+    from eval_tinder.db.base import session_scope
+    from eval_tinder.demo import seed_demo
+
+    with session_scope() as session:
+        result = seed_demo(session, name=name, partition_seed=partition_seed, simulate_expert=simulate_expert)
+    typer.echo(json.dumps({k: v for k, v in result.items() if k != "line_errors"}, indent=1, default=str))
+    if simulate_expert:
+        _err("note: simulated judgments are stored with reviewer 'simulated-expert' and are not expert evidence")
+
+
+@app.command()
+def experiment(
+    labeling_budget: int = typer.Option(32, help="Total human labels each strategy may use (TRAIN + DEV)."),
+    batch_size: int = typer.Option(10, help="Labels per round."),
+    max_metric_calls: int = typer.Option(60, help="GEPA metric-call budget per optimization round."),
+    seed: int = typer.Option(1),
+    output: Optional[Path] = typer.Option(None, help="Write the JSON report here (stdout otherwise)."),
+) -> None:
+    """Compare random versus committee selection under a fixed labeling budget (simulated expert; measured outcome)."""
+    from eval_tinder.db.base import get_session_factory
+    from eval_tinder.experiments.selection_experiment import run_experiment
+
+    result = run_experiment(
+        get_session_factory(), labeling_budget=labeling_budget, batch_size=batch_size,
+        max_metric_calls=max_metric_calls, seed=seed,
+    )
+    text = json.dumps(result, indent=1, default=str)
+    if output is not None:
+        output.write_text(text)
+        typer.echo(f"wrote {output}")
+    else:
+        typer.echo(text)
+    typer.echo(json.dumps(result["comparison"], indent=1, default=str), err=True)

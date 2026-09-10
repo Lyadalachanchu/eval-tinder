@@ -138,7 +138,7 @@ def create_run(
     settings: Settings | None = None,
 ) -> tuple[OptimizationRun, Job]:
     settings = settings or get_settings()
-    existing_job = session.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+    existing_job = job_service.find_existing(session, idempotency_key, project_id=project.id, kind=JobKind.OPTIMIZATION)
     if existing_job is not None:
         run = session.get(OptimizationRun, existing_job.payload_ref)
         assert run is not None
@@ -246,11 +246,14 @@ def evaluate_on_dev(
             session, project, runtime, [t for t, _ in pending], purpose=GradingPurpose.DEV_EVALUATION, job_id=job_id,
             settings=settings,
         )
-        for (t, _), r in zip(pending, runs, strict=True):
+        for (t, _), r in zip(pending, runs, strict=False):
             verdicts[t.id] = {"verdict": r.verdict, "status": r.status, "grading_run_id": r.id}
             if r.status == GradingStatus.BUDGET_EXHAUSTED:
                 complete = False
                 partial_reason = "budget exhausted"
+        if len(runs) < len(pending):
+            complete = False
+            partial_reason = partial_reason or "grading stopped early"
     except BudgetExhausted as e:
         complete = False
         partial_reason = str(e)
@@ -288,10 +291,19 @@ def evaluate_on_dev(
         agg["gepa_subscores_missing"] = sum(1 for s in gepa_subscores.values() if s is None)
     if existing is None:
         existing = CandidateEvaluation(
-            project_id=project.id, run_id=run_id, grader_id=grader.id, dev_snapshot_id=dev_snapshot.id, source=source
+            project_id=project.id, run_id=run_id, grader_id=grader.id, dev_snapshot_id=dev_snapshot.id, source=source,
+            per_case_scores={}, aggregate_metrics={},
         )
         session.add(existing)
-    existing.per_case_scores = {**(gepa_subscores and {"gepa": gepa_subscores} or {}), "app": per_case}
+    # Merge GEPA provenance from an earlier (incomplete) evaluation instead of wiping it.
+    prior_scores = dict(existing.per_case_scores or {})
+    gepa_entry = gepa_subscores if gepa_subscores is not None else prior_scores.get("gepa")
+    if gepa_subscores is None and (existing.aggregate_metrics or {}).get("gepa_val_score") is not None:
+        agg["gepa_val_score"] = existing.aggregate_metrics.get("gepa_val_score")
+    scores: dict[str, Any] = {"app": per_case}
+    if gepa_entry is not None:
+        scores["gepa"] = gepa_entry
+    existing.per_case_scores = scores
     existing.verdicts = verdicts
     existing.aggregate_metrics = agg
     existing.complete = complete
@@ -441,30 +453,53 @@ def execute_run(
             hb.stop()
     elapsed = time.perf_counter() - started
 
+    try:
+        return _finish_run(
+            session_factory, run_id, outcome, budget=budget, job_id=ctx.job_id if ctx else None, settings=settings,
+            evaluate_all=evaluate_all, grading=grading, elapsed=elapsed,
+        )
+    except Exception as e:  # noqa: BLE001 - a run must never stay RUNNING after a persistence failure
+        with session_factory() as s:
+            run = s.get(OptimizationRun, run_id)
+            if run is not None and run.state == OptimizationState.RUNNING:
+                run.state = OptimizationState.FAILED
+                run.error = f"persisting the outcome failed: {type(e).__name__}: {e}"[:4000]
+                run.usage = budget.snapshot()
+                s.commit()
+        raise
+
+
+def _finish_run(session_factory, run_id: str, outcome: OptimizationOutcome, *, budget: BudgetGuard, job_id: str | None,
+                settings: Settings, evaluate_all: bool, grading: Any, elapsed: float) -> dict[str, Any]:
     with session_factory() as s:
         run = s.get(OptimizationRun, run_id)
         project = s.get(Project, run.project_id)
         seed_grader = s.get(GraderVersion, run.seed_grader_id)
         dev_snapshot = s.get(DatasetSnapshot, run.dev_snapshot_id)
         summary = _persist_outcome(
-            s, project, run, seed_grader, dev_snapshot, outcome, budget=budget, job_id=ctx.job_id if ctx else None,
+            s, project, run, seed_grader, dev_snapshot, outcome, budget=budget, job_id=job_id,
             settings=settings, evaluate_all=evaluate_all, lm=grading,
         )
         summary["elapsed_seconds"] = round(elapsed, 1)
         run.usage = budget.snapshot()
-        run.result_summary = summary
-        if outcome.partial and "budget" in (outcome.partial_reason or "").lower():
+        # Terminal state from structured stop reasons (never substring matching). Budget exhaustion
+        # during the application-path DEV evaluation also makes the run partial.
+        if outcome.stop_reason == "budget_exhausted" or summary.get("evaluation_budget_exhausted"):
             run.state = OptimizationState.BUDGET_EXHAUSTED
-        elif outcome.partial and "cancel" in (outcome.partial_reason or "").lower():
+            summary["partial"] = True
+            summary["partial_reason"] = outcome.partial_reason or "provider budget exhausted during DEV evaluation"
+        elif outcome.stop_reason == "cancelled":
             run.state = OptimizationState.CANCELLED
+            summary["partial"] = True
         elif summary.get("improved"):
             run.state = OptimizationState.SUCCEEDED
         else:
             run.state = OptimizationState.NO_IMPROVEMENT
-        run.error = outcome.partial_reason
+        run.error = summary.get("partial_reason")
         from eval_tinder.ids import utcnow
 
         run.finished_at = utcnow()
+        run.result_summary = summary
         s.commit()
         return {"run_id": run_id, "state": run.state, **summary}
 
@@ -500,8 +535,23 @@ def _persist_outcome(
 
     members = set(outcome.member_indices())
     cfg = project_config(project)
-    to_evaluate = sorted(members | {0}) if not evaluate_all else [c.index for c in outcome.candidates]
-    to_evaluate = to_evaluate[: max(cfg.committee_max_shortlist, 2)] if not evaluate_all else to_evaluate
+    if evaluate_all:
+        to_evaluate = [c.index for c in outcome.candidates]
+    else:
+        # Always evaluate the seed and GEPA's own best candidate; rank the remaining members by their
+        # GEPA validation score (unknown scores last) before truncating to the shortlist cap.
+        must = {0}
+        if outcome.best_index is not None:
+            must.add(outcome.best_index)
+        ranked = sorted(
+            members - must,
+            key=lambda i: (
+                -(outcome.candidates[i].val_aggregate_score if outcome.candidates[i].val_aggregate_score is not None else -1.0),
+                i,
+            ),
+        )
+        cap = max(cfg.committee_max_shortlist, len(must))
+        to_evaluate = sorted(must) + ranked[: max(0, cap - len(must))]
     evaluations: dict[int, CandidateEvaluation] = {}
     exhausted = False
     for idx in to_evaluate:
@@ -580,7 +630,9 @@ def _persist_outcome(
         "total_metric_calls": outcome.total_metric_calls,
         "num_full_val_evals": outcome.num_full_val_evals,
         "usage": budget.snapshot(),
-        "evaluated_indices": sorted(evaluations),
+        "evaluated_indices": sorted(i for i, ev in evaluations.items() if ev.complete),
+        "unevaluated_indices": sorted(i for i, ev in evaluations.items() if not ev.complete),
+        "evaluation_budget_exhausted": exhausted or budget.exhausted,
         "note": "DEV agreement is a development result on a frozen snapshot, not evidence of production accuracy.",
     }
     return summary
@@ -588,6 +640,10 @@ def _persist_outcome(
 
 def optimization_job_handler(job: Job, ctx) -> dict[str, Any]:
     result = execute_run(ctx.session_factory, job.payload["run_id"], ctx=ctx, settings=ctx.settings)
+    if result.get("state") == OptimizationState.CANCELLED:
+        from eval_tinder.worker.main import JobCancelled
+
+        raise JobCancelled(f"optimization run {job.payload['run_id']} cancelled")
     if result.get("state") == OptimizationState.BUDGET_EXHAUSTED:
         # The run is already persisted as BUDGET_EXHAUSTED (partial, no invented scores). Surface the same
         # explicit state on the job: a spent budget must never be reported as a SUCCEEDED job.
@@ -647,6 +703,9 @@ def clear_shadow(session: Session, project: Project, *, reason: str, user: str) 
     project.configuration = {**(project.configuration or {}), "shadow_history": history}
     project.active_shadow_grader_id = None
     session.flush()
+    from eval_tinder.services import automation as automation_service
+
+    automation_service.invalidate_if_pipeline_changed(session, project)
     return project
 
 

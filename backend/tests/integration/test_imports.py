@@ -15,12 +15,13 @@ from sqlalchemy import func, select
 
 from eval_tinder.api.app import create_app
 from eval_tinder.db.enums import ExposureStatus, JobState, SourceType
-from eval_tinder.db.models import ImportBatch, Job, PartitionAssignment, Project, TraceSnapshot
+from eval_tinder.db.models import ExposureEvent, ImportBatch, Job, PartitionAssignment, Project, TraceSnapshot
 from eval_tinder.domain.partitions import DEFAULT_SPLIT, assign_partition
 from eval_tinder.domain.rendering import render_trace
 from eval_tinder.services import imports as import_service
 from eval_tinder.services.imports import enqueue_import, import_jsonl_sync, parse_jsonl
 from eval_tinder.services.projects import create_project, project_config
+from eval_tinder.services.review import eligible_traces
 from eval_tinder.worker.handlers import build_handlers
 from eval_tinder.worker.main import Worker, drain
 from tests.cases import DEV_CASES, TRAIN_CASES, DevCase
@@ -213,6 +214,102 @@ def test_changed_record_creates_revision_two_and_keeps_original_group(db_session
     assert rows[1].output == changed["output"] and rows[0].output == original["output"]
     assignments = assignments_of(db_session, project)
     assert set(assignments) == {"chat-103"}  # no assignment was created for the refused group
+
+
+def exposure_events_of(session, project: Project) -> set[tuple[str, str]]:
+    rows = session.scalars(select(ExposureEvent).where(ExposureEvent.project_id == project.id))
+    return {(e.group_id, e.kind) for e in rows}
+
+
+def test_revision_duplicating_content_across_partitions_quarantines_both_groups(db_session):
+    """A revision keeps its group, so a cross-partition exact duplicate cannot be merged away: quarantine."""
+    project = new_project(db_session)
+    (train_group,) = group_ids_for("TRAIN", 1)
+    (dev_group,) = group_ids_for("DEV", 1)
+    train_rec = record("train-r0", train_group, CASES[0], ref="train")
+    dev_rec = record("dev-r0", dev_group, CASES[1], ref="dev")
+    first = import_jsonl_sync(db_session, project, jsonl([train_rec, dev_rec]))
+    assert first.counts["inserted"] == 2 and first.counts["merged_duplicates"] == 0
+    assignments = assignments_of(db_session, project)
+    assert assignments[train_group].partition == "TRAIN" and assignments[dev_group].partition == "DEV"
+
+    # The TRAIN record is revised so that its content is byte-for-byte the DEV record's content.
+    revised = {**dev_rec, "external_id": "train-r0", "group_id": train_group}
+    batch = import_jsonl_sync(db_session, project, jsonl([revised]))
+    assert batch.state == "SUCCEEDED" and batch.line_errors == []
+    assert batch.counts["revised"] == 1 and batch.counts["inserted"] == 0
+    assert batch.counts["merged_duplicates"] == 0 and batch.counts["new_groups"] == 0
+    rows = traces_of(db_session, project, "train-r0")
+    assert [(t.revision, t.is_latest, t.group_id) for t in rows] == [
+        (1, False, train_group),
+        (2, True, train_group),
+    ]
+    (dev_trace,) = traces_of(db_session, project, "dev-r0")
+    assert rows[1].content_hash == dev_trace.content_hash  # identical evidence now sits in TRAIN and DEV ...
+    flagged = [w for w in batch.counts["warnings"] if w.get("external_id") == "train-r0"]
+    assert len(flagged) == 1
+    assert "exact duplicate of 'dev-r0'" in flagged[0]["warning"]
+    assert "quarantined" in flagged[0]["warning"]
+    assert flagged[0]["quarantined_groups"] == sorted([train_group, dev_group])
+    db_session.expire_all()
+    assignments = assignments_of(db_session, project)
+    # ... so both groups are quarantined; the partitions themselves are never rearranged.
+    assert assignments[train_group].exposure_status == ExposureStatus.QUARANTINED
+    assert assignments[dev_group].exposure_status == ExposureStatus.QUARANTINED
+    assert assignments[train_group].partition == "TRAIN" and assignments[dev_group].partition == "DEV"
+    assert exposure_events_of(db_session, project) == {
+        (train_group, "QUARANTINED"),
+        (dev_group, "QUARANTINED"),
+    }
+    assert eligible_traces(db_session, project, "TRAIN") == []
+    assert eligible_traces(db_session, project, "DEV") == []
+    # Re-importing the same revised file is still idempotent and does not re-flag anything.
+    again = import_jsonl_sync(db_session, project, jsonl([revised]))
+    assert again.counts["unchanged"] == 1 and again.counts["revised"] == 0
+    assert [w for w in again.counts["warnings"] if w.get("external_id")] == []
+    assert len(exposure_events_of(db_session, project)) == 2
+
+
+def test_revision_duplicating_content_within_a_partition_warns_without_quarantine(db_session):
+    project = new_project(db_session)
+    group_a, group_b = group_ids_for("TRAIN", 2)
+    rec_a = record("a-r0", group_a, CASES[0], ref="a")
+    rec_b = record("b-r0", group_b, CASES[1], ref="b")
+    import_jsonl_sync(db_session, project, jsonl([rec_a, rec_b]))
+
+    revised = {**rec_b, "external_id": "a-r0", "group_id": group_a}
+    batch = import_jsonl_sync(db_session, project, jsonl([revised]))
+    assert batch.counts["revised"] == 1 and batch.counts["merged_duplicates"] == 0
+    rows = traces_of(db_session, project, "a-r0")
+    assert [(t.revision, t.is_latest, t.group_id) for t in rows] == [(1, False, group_a), (2, True, group_a)]
+    flagged = [w for w in batch.counts["warnings"] if w.get("external_id") == "a-r0"]
+    assert len(flagged) == 1
+    assert "exact duplicate of 'b-r0'" in flagged[0]["warning"]
+    assert "quarantined" not in flagged[0]["warning"] and "quarantined_groups" not in flagged[0]
+    # Same partition: no leakage across the split, so nothing is quarantined.
+    db_session.expire_all()
+    assignments = assignments_of(db_session, project)
+    assert {assignments[g].exposure_status for g in (group_a, group_b)} == {ExposureStatus.UNTOUCHED}
+    assert exposure_events_of(db_session, project) == set()
+    assert {t.group_id for t in eligible_traces(db_session, project, "TRAIN")} == {group_a, group_b}
+
+
+def test_revision_reverting_to_its_own_earlier_content_is_not_a_duplicate(db_session):
+    project = new_project(db_session)
+    (group,) = group_ids_for("TRAIN", 1)
+    original = record("chat-7", group, CASES[0])
+    import_jsonl_sync(db_session, project, jsonl([original]))
+    changed = {**original, "output": "Your cancellation request is processing."}
+    import_jsonl_sync(db_session, project, jsonl([changed]))
+    reverted = import_jsonl_sync(db_session, project, jsonl([original]))
+
+    assert reverted.counts["revised"] == 1 and reverted.counts["unchanged"] == 0
+    assert [w for w in reverted.counts["warnings"] if w.get("external_id")] == []
+    rows = traces_of(db_session, project, "chat-7")
+    assert [(t.revision, t.is_latest) for t in rows] == [(1, False), (2, False), (3, True)]
+    assert rows[2].content_hash == rows[0].content_hash and {t.group_id for t in rows} == {group}
+    assert assignments_of(db_session, project)[group].exposure_status == ExposureStatus.UNTOUCHED
+    assert exposure_events_of(db_session, project) == set()
 
 
 def test_exact_duplicate_under_new_external_id_merges_into_existing_group(db_session):

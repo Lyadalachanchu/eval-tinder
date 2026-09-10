@@ -60,10 +60,11 @@ class SelectionError(ValueError):
 def create_selection_round(
     session: Session, project: Project, *, seed: int | None, idempotency_key: str, settings: Settings | None = None
 ) -> tuple[SelectionRound, Job]:
-    existing_job = session.scalar(select(Job).where(Job.idempotency_key == idempotency_key))
+    existing_job = job_service.find_existing(session, idempotency_key, project_id=project.id, kind=JobKind.SELECTION)
     if existing_job is not None:
         rnd = session.get(SelectionRound, existing_job.payload_ref)
-        assert rnd is not None
+        if rnd is None:
+            raise SelectionError(f"idempotency_key {idempotency_key!r} does not belong to a selection round")
         return rnd, existing_job
     active = session.scalar(
         select(SelectionRound).where(
@@ -395,9 +396,32 @@ def selection_job_handler(job: Job, ctx) -> dict[str, Any]:
     return execute_selection_round(ctx.session_factory, job.payload["round_id"], ctx=ctx, settings=ctx.settings)
 
 
-def round_view(rnd: SelectionRound) -> dict[str, Any]:
+def round_view(rnd: SelectionRound, session: Session | None = None) -> dict[str, Any]:
+    """Public view of a round. Per-request categories stay hidden until that request is judged."""
+    from eval_tinder.db.models import ReviewRequest
+    from eval_tinder.services.review import reveal_allowed
+
     report = rnd.committee_report or {}
     scores = rnd.scores or {}
+    states: dict[str, ReviewRequest] = {}
+    if session is not None and rnd.selected_requests:
+        ids = [e.get("request_id") for e in rnd.selected_requests if e.get("request_id")]
+        states = {r.id: r for r in session.scalars(select(ReviewRequest).where(ReviewRequest.id.in_(ids)))}
+    selected = []
+    category_counts: dict[str, int] = {}
+    for entry in rnd.selected_requests or []:
+        category_counts[entry.get("category", "?")] = category_counts.get(entry.get("category", "?"), 0) + 1
+        req = states.get(entry.get("request_id"))
+        revealed = req is not None and reveal_allowed(req)
+        selected.append(
+            {
+                "request_id": entry.get("request_id"),
+                "trace_id": entry.get("trace_id"),
+                "category": entry.get("category") if revealed else "HIDDEN",
+                "state": req.state if req is not None else None,
+                "expected_reading_length": entry.get("expected_reading_length"),
+            }
+        )
     return {
         "id": rnd.id,
         "project_id": rnd.project_id,
@@ -417,7 +441,8 @@ def round_view(rnd: SelectionRound) -> dict[str, Any]:
         },
         "probe_size": len(rnd.probe_ids or []),
         "pool_size": len(rnd.pool_ids or []),
-        "selected_requests": rnd.selected_requests or [],
+        "selected_requests": selected,
+        "category_counts": category_counts,
         "exhausted": scores.get("exhausted", {}),
         "context_repair": scores.get("context_repair", []),
         "batch_id": rnd.batch_id,

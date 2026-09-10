@@ -6,6 +6,9 @@ from typing import Any
 
 from eval_tinder.grader.signature import PREDICTOR_NAME, get_instructions
 
+STOP_CANCELLED = "cancelled"
+STOP_BUDGET_EXHAUSTED = "budget_exhausted"
+
 
 @dataclass
 class CandidateRecord:
@@ -29,6 +32,10 @@ class OptimizationOutcome:
     usage: dict[str, Any] = field(default_factory=dict)
     partial: bool = False
     partial_reason: str | None = None
+    # Structured stop reason for a partial outcome: STOP_CANCELLED or STOP_BUDGET_EXHAUSTED (None when the
+    # optimizer ran to completion). Callers must branch on this, never on the free-text ``partial_reason``:
+    # a cancellation message may legitimately mention the budget ("cancelled before the budget was spent").
+    stop_reason: str | None = None
 
     def member_indices(self) -> list[int]:
         members: set[int] = set()

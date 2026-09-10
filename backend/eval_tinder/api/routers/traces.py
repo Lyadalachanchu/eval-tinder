@@ -54,11 +54,20 @@ def list_traces(
     }
     shadow_runs: dict[str, GradingRun] = {}
     if project.active_shadow_grader_id and trace_ids:
+        from eval_tinder.services.review import open_request_trace_ids
+
+        blind = open_request_trace_ids(db, project.id)  # never show machine verdicts on cases awaiting blind review
         for r in db.scalars(
-            select(GradingRun).where(GradingRun.grader_id == project.active_shadow_grader_id, GradingRun.trace_id.in_(trace_ids))
+            select(GradingRun)
+            .where(
+                GradingRun.grader_id == project.active_shadow_grader_id,
+                GradingRun.trace_id.in_(trace_ids),
+                GradingRun.purpose == "BULK",  # development evaluations and committee votes are not shadow predictions
+            )
             .order_by(GradingRun.created_at)
         ):
-            shadow_runs[r.trace_id] = r
+            if r.trace_id not in blind:
+                shadow_runs[r.trace_id] = r
     items = []
     for t, part in rows:
         j = judgments.get(t.id)

@@ -105,7 +105,8 @@ def test_audit_lifecycle_through_the_api(client, db_session, session_factory, se
     assert case["predictions"] is None and case["request"]["selection_reason"] is None  # blind after judging too
     assert case["request"]["state"] == "JUDGED"
     assert client.get(f"/projects/{pid}/judgments").json() == []  # audit labels only via the report
-    assert client.get(f"/projects/{pid}/review-requests", params={"purpose": "AUDIT"}).json()[0]["selection_reason"] is None
+    # Locked audit requests are never enumerable through the ordinary listing (that would expose the sample).
+    assert client.get(f"/projects/{pid}/review-requests", params={"purpose": "AUDIT"}).status_code == 400
     assert client.get(f"/audits/{audit_id}").json()["report"] is None  # GET never recomputes
     out = client.get(f"/audits/{audit_id}").json()
     assert out["judged_count"] == 20 and out["unresolved_count"] == 0 and out["state"] == "IN_REVIEW"
